@@ -1,0 +1,7 @@
+{
+  "name": "@sluice/api",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": { "build": "tsc -p tsconfig.json", "start": "node dist/server.js", "dev": "tsx src/server.ts", "test": "vitest run --passWithNoTests", "typecheck": "tsc -p tsconfig.check.json" },
+  "dependencies": { "@sluice/core": "workspace:*", "hono": "^4.6.0", "@hono/node-server": "^1.13.0" }
+}

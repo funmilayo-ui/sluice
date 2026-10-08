@@ -1,0 +1,9 @@
+node_modules
+dist
+target
+.env
+*.log
+.vercel
+test-results
+playwright-report
+*.tsbuildinfo

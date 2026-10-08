@@ -1,0 +1,41 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  ts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      # Packages depend on each other's build output, so build before type checking and testing.
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+  # The built app in a real browser against live Stellar mainnet quotes. Nothing is signed.
+  e2e:
+    runs-on: ubuntu-latest
+    needs: ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm --filter @sluice/web exec playwright install --with-deps chromium
+      - run: pnpm e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: playwright-traces, path: apps/web/test-results, retention-days: 7 }
+  contract:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: contracts } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32v1-none }
+      - run: cargo test
+      - run: cargo install --locked stellar-cli
+      - run: stellar contract build --manifest-path router/Cargo.toml

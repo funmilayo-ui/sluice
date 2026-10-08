@@ -1,0 +1,146 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+/*
+  One accent (teal), one cool-tinted gray family, two themes from the same tokens.
+  Light and dark follow the system; there is no toggle to get out of sync with it.
+*/
+:root {
+  --bg: #eef1f0;
+  --surface: #ffffff;
+  --sunken: #f4f6f5;
+  --shell: rgb(16 44 40 / 0.045);
+  --ink: #0f1a18;
+  --muted: #55645f;
+  --faint: #8a9793;
+  --line: rgb(15 26 24 / 0.09);
+  --highlight: rgb(255 255 255 / 0.9);
+  --accent: #0b6b61;
+  --accent-ink: #f3fffc;
+  --accent-soft: rgb(11 107 97 / 0.09);
+  --warn: #8a4b00;
+  --warn-soft: #fdf1dc;
+  --bad: #9b1c1c;
+  --bad-soft: #fbe9e9;
+  --glow: rgb(11 107 97 / 0.13);
+  --shadow: 0 1px 1px rgb(16 44 40 / 0.03), 0 18px 48px -18px rgb(16 44 40 / 0.18);
+  --overlay: rgb(238 241 240 / 0.72);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a0f0e;
+    --surface: #111817;
+    --sunken: #0d1312;
+    --shell: rgb(255 255 255 / 0.035);
+    --ink: #e6eeec;
+    --muted: #94a4a0;
+    --faint: #63726e;
+    --line: rgb(230 238 236 / 0.09);
+    --highlight: rgb(255 255 255 / 0.05);
+    --accent: #3fd0bf;
+    --accent-ink: #04211d;
+    --accent-soft: rgb(63 208 191 / 0.11);
+    --warn: #f0bf76;
+    --warn-soft: #2a2011;
+    --bad: #ff9a9a;
+    --bad-soft: #2b1414;
+    --glow: rgb(63 208 191 / 0.1);
+    --shadow: 0 1px 1px rgb(0 0 0 / 0.2), 0 24px 60px -24px rgb(0 0 0 / 0.7);
+    --overlay: rgb(10 15 14 / 0.72);
+  }
+}
+
+@theme inline {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-shell: var(--shell);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --shadow-float: var(--shadow);
+  --animate-rise: rise 0.7s cubic-bezier(0.32, 0.72, 0, 1) both;
+  --animate-sweep: sweep 1.4s cubic-bezier(0.32, 0.72, 0, 1) infinite;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes sweep {
+  to { background-position: -200% 0; }
+}
+
+@layer base {
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  /* Ambient light: one soft source, top left. Fixed, so it never repaints on scroll. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(60rem 36rem at 12% -8%, var(--glow), transparent 62%),
+      radial-gradient(44rem 30rem at 96% 4%, var(--glow), transparent 68%);
+  }
+  /* Film grain to take the digital flatness off large surfaces. */
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    pointer-events: none;
+    opacity: 0.035;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  h1, h2, h3 { text-wrap: balance; }
+  p { text-wrap: pretty; }
+  button { cursor: pointer; }
+  button:disabled { cursor: not-allowed; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  ::selection { background: var(--accent-soft); }
+  input::placeholder { color: var(--faint); }
+  dialog { color: inherit; }
+  dialog::backdrop { background: var(--overlay); backdrop-filter: blur(10px); }
+}
+
+@layer components {
+  /* Figures: tabular so columns of amounts line up and digits do not jitter as quotes refresh. */
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .scroll-thin { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  .skeleton {
+    border-radius: 1rem;
+    background: linear-gradient(90deg, var(--shell), var(--line), var(--shell));
+    background-size: 200% 100%;
+    animation: var(--animate-sweep);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  html { scroll-behavior: auto; }
+}

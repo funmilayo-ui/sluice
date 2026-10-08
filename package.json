@@ -1,0 +1,31 @@
+{
+  "name": "sluice",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.22.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "w0:probe": "tsx scripts/w0-probe.ts",
+    "w0:trace": "tsx scripts/w0-trace.ts",
+    "w0:aqua-sim": "tsx scripts/w0-aqua-sim.ts",
+    "w0:venue-sim": "tsx scripts/w0-venue-sim.ts",
+    "w0:stable": "tsx scripts/w0-stable.ts",
+    "w0:testnet-decode": "tsx scripts/w0-testnet-decode.ts",
+    "start": "node packages/api/dist/server.js",
+    "dev": "pnpm --filter @sluice/api dev",
+    "dev:web": "pnpm --filter @sluice/web dev",
+    "e2e": "pnpm --filter @sluice/web e2e",
+    "w0:testnet-flow": "tsx scripts/w0-testnet-flow.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "@types/node": "^22.0.0"
+  },
+  "dependencies": {
+    "@vercel/functions": "3.9.11"
+  }
+}
