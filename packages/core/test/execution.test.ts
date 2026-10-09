@@ -339,6 +339,20 @@ describe("cached name lookup", () => {
     expect(answers).toHaveLength(3);
   });
 
+  it("asks again by itself when the only attempt hangs, without another caller arriving", async () => {
+    const attempts: Cb[] = [];
+    const lookup = createCachedLookup((_h: string, _o: object, cb: Cb) => { attempts.push(cb); }, 1000, 10_000, Date.now, 20);
+    const only = ask(lookup, "a.test", {});
+    expect(attempts).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 60));
+    expect(attempts.length).toBeGreaterThanOrEqual(2);
+    expect(attempts.length).toBeLessThanOrEqual(3); // never more than three attempts for a name
+    attempts[1]!(null, [V4]);
+    expect((await only).address).toBe("1.2.3.4");
+    await new Promise((r) => setTimeout(r, 60));
+    expect(attempts.length).toBeLessThanOrEqual(3); // and none after it was answered
+  });
+
   it("reports a failure only when every attempt has failed", async () => {
     let clock = 0;
     const attempts: Cb[] = [];

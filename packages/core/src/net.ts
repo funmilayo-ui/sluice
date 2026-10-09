@@ -26,12 +26,13 @@ const notFound = (hostname: string): NodeJS.ErrnoException => Object.assign(new 
  * while a fresh lookup runs behind them. Callers asking for a name that is already being resolved share that
  * request, but only for `hedgeMs`: a first lookup can hang on a slow resolver for many seconds while a second
  * one, asked a moment later, is answered at once (seen 2026-10-09: sharing without this limit pinned every
- * connection to a lookup that took over 20 seconds). The first success answers everyone; a failure is only
- * reported when no attempt is left, and is never cached. Addresses keep the resolver's order.
+ * connection to a lookup that took over 20 seconds). After `hedgeMs` the name is asked again, on a timer or
+ * when another caller arrives, up to three attempts in all. The first success answers everyone; a failure is
+ * only reported when no attempt is left, and is never cached. Addresses keep the resolver's order.
  */
 export function createCachedLookup(original: Lookup, ttlMs = 5 * 60_000, staleMs = 60 * 60_000, now: () => number = Date.now, hedgeMs = 1500) {
   type Waiter = (err: NodeJS.ErrnoException | null, list: Resolved[]) => void;
-  interface Flight { waiters: Waiter[]; attempts: number; lastStart: number }
+  interface Flight { waiters: Waiter[]; attempts: number; launched: number; lastStart: number }
   const MAX_ATTEMPTS = 3;
   const cache = new Map<string, { at: number; list: Resolved[] }>();
   const pending = new Map<string, Flight>();
@@ -44,7 +45,14 @@ export function createCachedLookup(original: Lookup, ttlMs = 5 * 60_000, staleMs
 
   function launch(hostname: string, flight: Flight): void {
     flight.attempts++;
+    flight.launched++;
     flight.lastStart = now();
+    // Ask again by itself if this attempt is still out after the hedge interval: the callers already waiting
+    // must not depend on someone else arriving later to be rescued from a hung lookup.
+    const again = setTimeout(() => {
+      if (pending.get(hostname) === flight && flight.launched < MAX_ATTEMPTS) launch(hostname, flight);
+    }, hedgeMs);
+    again.unref?.();
     original(hostname, { all: true }, (err, address) => {
       flight.attempts--;
       const list = !err && Array.isArray(address) ? (address as Resolved[]) : [];
@@ -62,13 +70,13 @@ export function createCachedLookup(original: Lookup, ttlMs = 5 * 60_000, staleMs
     let flight = pending.get(hostname);
     if (!flight) {
       // The waiter is registered before the lookup starts, so a resolver that answers synchronously still reaches it.
-      flight = { waiters: waiter ? [waiter] : [], attempts: 0, lastStart: 0 };
+      flight = { waiters: waiter ? [waiter] : [], attempts: 0, launched: 0, lastStart: 0 };
       pending.set(hostname, flight);
       launch(hostname, flight);
       return;
     }
     if (waiter) flight.waiters.push(waiter);
-    if (now() - flight.lastStart >= hedgeMs && flight.attempts < MAX_ATTEMPTS) launch(hostname, flight);
+    if (now() - flight.lastStart >= hedgeMs && flight.launched < MAX_ATTEMPTS) launch(hostname, flight);
   }
 
   function answer(hostname: string, opts: LookupOptions, cb: LookupCallback, list: Resolved[]): void {

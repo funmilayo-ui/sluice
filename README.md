@@ -20,7 +20,7 @@ Mainnet only. Non-custodial: the server builds and simulates transactions and re
 pnpm install
 pnpm build                         # packages, then the web app into apps/web/dist
 pnpm start                         # API and web app on http://localhost:8787
-pnpm test                          # 157 TypeScript tests (core 73, api 45, sdk 12, web 27)
+pnpm test                          # 158 TypeScript tests (core 74, api 45, sdk 12, web 27)
 PW_CHANNEL=chrome pnpm e2e         # 12 browser checks on desktop and phone, against live mainnet data
 pnpm w0:testnet-flow               # settles real testnet swaps with throwaway keys (post-signature path)
 cd contracts && cargo test         # 13 contract tests
