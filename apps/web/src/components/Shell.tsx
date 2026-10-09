@@ -165,7 +165,8 @@ export function PendingBanner({ flow, onResume }: { flow: Flow; onResume(): void
   );
 }
 
-const REPO = import.meta.env.VITE_REPO_URL as string | undefined;
+/** Where the source lives. A fork or a mirror builds with VITE_REPO_URL set to its own address. */
+const REPO = (import.meta.env.VITE_REPO_URL as string | undefined) || "https://github.com/funmilayo-ui/sluice";
 
 export function Footer() {
   return (
@@ -175,7 +176,7 @@ export function Footer() {
           Sluice is an open-source router for Stellar liquidity. Quotes come live from the Stellar DEX, Aquarius, Soroswap, Phoenix and Comet; lending data from Blend. It runs no order book and takes no fee.
         </p>
         <ul className="flex shrink-0 flex-wrap gap-x-6 gap-y-2">
-          {REPO && <li><a href={REPO} target="_blank" rel="noreferrer" className="-my-2 inline-block py-2 underline-offset-4 hover:text-ink hover:underline">Source code</a></li>}
+          <li><a href={REPO} target="_blank" rel="noreferrer" className="-my-2 inline-block py-2 underline-offset-4 hover:text-ink hover:underline">Source code</a></li>
           <li><a href="/health" className="-my-2 inline-block py-2 underline-offset-4 hover:text-ink hover:underline">API status</a></li>
           <li><a href="https://stellar.expert/explorer/public" target="_blank" rel="noreferrer" className="-my-2 inline-block py-2 underline-offset-4 hover:text-ink hover:underline">StellarExpert</a></li>
         </ul>
