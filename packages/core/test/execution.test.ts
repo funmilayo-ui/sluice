@@ -266,26 +266,34 @@ describe("asset lists", () => {
 
 describe("cached name lookup", () => {
   type Cb = (err: NodeJS.ErrnoException | null, address?: unknown, family?: number) => void;
-  const answer = (lookup: ReturnType<typeof createCachedLookup>, host: string, options: object = { all: true }) =>
-    new Promise<{ err: unknown; address: unknown }>((resolve) => lookup(host, options, (err, address) => resolve({ err, address })));
+  const V4 = { address: "1.2.3.4", family: 4 };
+  const V6 = { address: "2001:db8::1", family: 6 };
+  const ask = (lookup: ReturnType<typeof createCachedLookup>, host: string, options: object | number = { all: true }) =>
+    new Promise<{ err: NodeJS.ErrnoException | null; address: unknown; family?: number }>((resolve) => lookup(host, options as never, (err, address, family) => resolve({ err, address, family })));
 
-  it("shares one request between concurrent lookups, then serves from memory", async () => {
-    let calls = 0;
+  it("resolves a name once and answers every shape of question from it", async () => {
+    const asked: [string, object][] = [];
     const release: (() => void)[] = [];
-    const original = (_h: string, _o: object, cb: Cb) => { calls++; release.push(() => cb(null, [{ address: "1.2.3.4", family: 4 }])); };
+    const original = (h: string, o: object, cb: Cb) => { asked.push([h, o]); release.push(() => cb(null, [V4, V6])); };
     const lookup = createCachedLookup(original);
-    const both = Promise.all([answer(lookup, "a.test"), answer(lookup, "a.test")]);
-    expect(calls).toBe(1);
+    // Two connections and an early warm-up ask at once, with different options: one request goes out.
+    const all = Promise.all([ask(lookup, "a.test"), ask(lookup, "a.test", {}), ask(lookup, "a.test", { family: 6 })]);
+    expect(asked).toEqual([["a.test", { all: true }]]);
     release[0]!();
-    const [x, y] = await both;
-    expect(x.address).toEqual([{ address: "1.2.3.4", family: 4 }]);
-    expect(x.address).not.toBe(y.address); // each caller gets its own copy
-    expect((await answer(lookup, "a.test")).address).toEqual([{ address: "1.2.3.4", family: 4 }]);
-    expect(calls).toBe(1);
-    // A different name or a different question is a different lookup.
-    void answer(lookup, "b.test");
-    void answer(lookup, "a.test", { family: 4 });
-    expect(calls).toBe(3);
+    const [every, first, six] = await all;
+    expect(every.address).toEqual([V4, V6]);
+    expect(first).toMatchObject({ address: "1.2.3.4", family: 4 });
+    expect(six).toMatchObject({ address: "2001:db8::1", family: 6 });
+    // Later questions of any shape come from memory, as copies the caller may change.
+    expect((await ask(lookup, "a.test", 4)).address).toBe("1.2.3.4");
+    expect((await ask(lookup, "a.test", { all: true, family: "IPv4" })).address).toEqual([V4]);
+    const copy = (await ask(lookup, "a.test")).address as object[];
+    copy.length = 0;
+    expect((await ask(lookup, "a.test")).address).toEqual([V4, V6]);
+    expect(asked).toHaveLength(1);
+    // Another name is another lookup.
+    void ask(lookup, "b.test");
+    expect(asked).toHaveLength(2);
   });
 
   it("serves a stale answer at once while refreshing behind it, and never caches a failure", async () => {
@@ -293,29 +301,72 @@ describe("cached name lookup", () => {
     let fail = true;
     let ip = "1.1.1.1";
     let calls = 0;
-    const original = (_h: string, _o: object, cb: Cb) => { calls++; queueMicrotask(() => (fail ? cb(Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" })) : cb(null, ip, 4))); };
+    const original = (_h: string, _o: object, cb: Cb) => { calls++; queueMicrotask(() => (fail ? cb(Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" })) : cb(null, [{ address: ip, family: 4 }]))); };
     const lookup = createCachedLookup(original, 1000, 10_000, () => clock);
-    expect((await answer(lookup, "a.test", {})).err).toBeTruthy();
+    expect((await ask(lookup, "a.test", {})).err?.code).toBe("ENOTFOUND");
     fail = false;
-    expect((await answer(lookup, "a.test", {})).address).toBe("1.1.1.1"); // the failure was not remembered
+    expect((await ask(lookup, "a.test", {})).address).toBe("1.1.1.1"); // the failure was not remembered
     expect(calls).toBe(2);
     clock = 5000; // past the TTL, inside the stale window
     ip = "2.2.2.2";
-    expect((await answer(lookup, "a.test", {})).address).toBe("1.1.1.1"); // old answer, immediately
+    expect((await ask(lookup, "a.test", {})).address).toBe("1.1.1.1"); // old answer, immediately
     expect(calls).toBe(3); // and a refresh was started
     await new Promise((r) => setTimeout(r, 0));
-    expect((await answer(lookup, "a.test", {})).address).toBe("2.2.2.2");
+    expect((await ask(lookup, "a.test", {})).address).toBe("2.2.2.2");
     clock = 50_000; // past the stale window: wait for a fresh answer
     ip = "3.3.3.3";
-    expect((await answer(lookup, "a.test", {})).address).toBe("3.3.3.3");
+    expect((await ask(lookup, "a.test", {})).address).toBe("3.3.3.3");
   });
 
-  it("accepts the callback-only and numeric-family call shapes Node uses", async () => {
-    const seen: object[] = [];
-    const lookup = createCachedLookup((_h: string, o: object, cb: Cb) => { seen.push(o); cb(null, "9.9.9.9", 4); });
-    await new Promise<void>((r) => lookup("a.test", (() => r()) as never));
-    await new Promise<void>((r) => lookup("a.test", 4, () => r()));
-    expect(seen).toEqual([{}, { family: 4 }]);
+  it("does not pin later callers to a lookup that hangs: after a short wait a second one is asked", async () => {
+    let clock = 0;
+    const attempts: Cb[] = [];
+    const lookup = createCachedLookup((_h: string, _o: object, cb: Cb) => { attempts.push(cb); }, 1000, 10_000, () => clock, 1500);
+    const answers: unknown[] = [];
+    const first = ask(lookup, "a.test", {}).then((r) => answers.push(r.address));
+    clock = 500;
+    const soon = ask(lookup, "a.test", {}).then((r) => answers.push(r.address)); // joins the first attempt
+    expect(attempts).toHaveLength(1);
+    clock = 2000;
+    const later = ask(lookup, "a.test", {}).then((r) => answers.push(r.address)); // the first is taking too long: ask again
+    expect(attempts).toHaveLength(2);
+    attempts[1]!(null, [V4]); // the second attempt answers; the first is still hanging
+    await Promise.all([first, soon, later]);
+    expect(answers).toEqual(["1.2.3.4", "1.2.3.4", "1.2.3.4"]);
+    // The hung attempt finally fails: nobody is told twice, and the good answer stays cached.
+    attempts[0]!(Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" }));
+    expect((await ask(lookup, "a.test", {})).address).toBe("1.2.3.4");
+    expect(answers).toHaveLength(3);
+  });
+
+  it("reports a failure only when every attempt has failed", async () => {
+    let clock = 0;
+    const attempts: Cb[] = [];
+    const lookup = createCachedLookup((_h: string, _o: object, cb: Cb) => { attempts.push(cb); }, 1000, 10_000, () => clock, 1500);
+    const a = ask(lookup, "a.test", {});
+    clock = 2000;
+    const b = ask(lookup, "a.test", {});
+    const down = Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" });
+    attempts[0]!(down);
+    let settled = false;
+    void a.then(() => { settled = true; });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(settled).toBe(false); // one attempt is still out
+    attempts[1]!(down);
+    expect((await a).err?.code).toBe("EAI_AGAIN");
+    expect((await b).err?.code).toBe("EAI_AGAIN");
+  });
+
+  it("reports not found when a name has no address of the family asked for, or none at all", async () => {
+    const lookup = createCachedLookup((h: string, _o: object, cb: Cb) => cb(null, h === "empty.test" ? [] : [V4]));
+    expect((await ask(lookup, "a.test", { family: 6 })).err?.code).toBe("ENOTFOUND");
+    expect((await ask(lookup, "empty.test", {})).err?.code).toBe("ENOTFOUND");
+  });
+
+  it("accepts the callback-only call shape and a resolver that answers synchronously", async () => {
+    const lookup = createCachedLookup((_h: string, _o: object, cb: Cb) => cb(null, [V4]));
+    const got = await new Promise<unknown>((r) => lookup("a.test", ((_e: unknown, address: unknown) => r(address)) as never));
+    expect(got).toBe("1.2.3.4");
   });
 });
 

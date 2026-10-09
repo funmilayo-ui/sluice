@@ -68,6 +68,10 @@ export function createSluice(env: Env = process.env, extra: { cache?: KvCache; w
     timeoutMs: Number(env.SOURCE_TIMEOUT_MS ?? 8000),
   });
   const deps = defaultDeps(env);
+  // Resolve the venue hosts as soon as the process starts. Lookups are cached per host and shared, so the
+  // first quote's connections join these instead of starting their own; a cold lookup can take seconds.
+  const venueHosts = [env.HORIZON_URL ?? "https://horizon.stellar.org", env.AQUARIUS_URL ?? "https://amm-api.aqua.network", env.RPC_URL ?? "https://mainnet.sorobanrpc.com"];
+  void preResolve(venueHosts);
   const app = createApp(router, deps, { routerContract, scorer, vaults: parseVaults(env.BLEND_POOLS), webDir: extra.webDir });
 
   return {
@@ -77,8 +81,7 @@ export function createSluice(env: Env = process.env, extra: { cache?: KvCache; w
      * visitor needs first: the asset list (three small fetches), then the heavier pool discovery and scoring.
      */
     async warm(): Promise<void> {
-      // Names first, all at once: a cold lookup can take seconds and everything below waits on one.
-      await preResolve([env.HORIZON_URL ?? "https://horizon.stellar.org", env.AQUARIUS_URL ?? "https://amm-api.aqua.network", env.RPC_URL ?? "https://mainnet.sorobanrpc.com", ...DEFAULT_ASSET_LISTS.map((l) => l.url)]);
+      void preResolve(DEFAULT_ASSET_LISTS.map((l) => l.url));
       await deps.assets().catch(() => undefined);
       await Promise.all([...sources.map((s) => s.warm?.()), scorer.refreshIfStale()]).catch(() => undefined);
     },
