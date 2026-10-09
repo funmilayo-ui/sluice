@@ -1,6 +1,7 @@
 {
   "name": "@sluice/web",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "Sluice web app: quote, sign in your own wallet, settle on Stellar mainnet",

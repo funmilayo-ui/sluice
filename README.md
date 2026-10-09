@@ -93,5 +93,8 @@ vercel firewall diff && vercel firewall publish --yes
 ```
 The security headers in `vercel.json` repeat `SECURITY_HEADERS` in `packages/api/src/app.ts`: change both together.
 
+## License
+MIT. See [LICENSE](./LICENSE).
+
 ## Licensing note
 Phoenix's contracts are GPL-3.0 and StellarBroker's router contract is MIT. This repo calls Phoenix on-chain through its public interface and copies no code from either; the adapter call shapes were re-verified against the deployed contracts. Blend's pool status rules, rate curve and error numbers were read from `blend-contracts-v2` and re-implemented, not copied.
