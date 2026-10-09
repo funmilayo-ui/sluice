@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createStablecoinScorer, preferIpv4, Router, type KvCache } from "@sluice/core";
+import { cacheDnsLookups, createStablecoinScorer, DEFAULT_ASSET_LISTS, preferIpv4, preResolve, Router, type KvCache } from "@sluice/core";
 import { createApp, DEFAULT_HUBS, DEFAULT_VAULTS, defaultDeps, defaultSources, type VaultConfig } from "./app.js";
 
 type Env = Record<string, string | undefined>;
@@ -45,6 +45,8 @@ export function builtWebDir(): string | undefined {
 export function createSluice(env: Env = process.env, extra: { cache?: KvCache; webDir?: string } = {}) {
   // Some hosts have a broken IPv6 route, which makes fetch time out where curl works.
   if (env.SLUICE_IPV4_FIRST === "1") preferIpv4();
+  // Keep name lookups in the process (set SLUICE_DNS_CACHE=0 to leave resolution entirely to the system).
+  if (env.SLUICE_DNS_CACHE !== "0") cacheDnsLookups();
 
   // Stablecoins scored from live Horizon data, for the health badges and the ranking bias. Comma separated
   // CODE:ISSUER; unset uses the verified default set, an empty value turns scoring off.
@@ -75,6 +77,8 @@ export function createSluice(env: Env = process.env, extra: { cache?: KvCache; w
      * visitor needs first: the asset list (three small fetches), then the heavier pool discovery and scoring.
      */
     async warm(): Promise<void> {
+      // Names first, all at once: a cold lookup can take seconds and everything below waits on one.
+      await preResolve([env.HORIZON_URL ?? "https://horizon.stellar.org", env.AQUARIUS_URL ?? "https://amm-api.aqua.network", env.RPC_URL ?? "https://mainnet.sorobanrpc.com", ...DEFAULT_ASSET_LISTS.map((l) => l.url)]);
       await deps.assets().catch(() => undefined);
       await Promise.all([...sources.map((s) => s.warm?.()), scorer.refreshIfStale()]).catch(() => undefined);
     },

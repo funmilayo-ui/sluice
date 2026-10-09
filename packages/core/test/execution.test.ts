@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Asset, Keypair, nativeToScVal, Networks, Operation, Transaction, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
 import {
-  blendRates, buildChangeTrust, buildClassicSwap, buildCometSwap, buildSoroswapSwap, buildVaultDeposit, buildVaultWithdraw, createAssetList, createGate,
+  blendRates, buildChangeTrust, buildClassicSwap, buildCometSwap, buildSoroswapSwap, buildVaultDeposit, buildVaultWithdraw, createAssetList, createCachedLookup, createGate,
   createStablecoinScorer, describeReserve, EXPLAINED_RESULT_CODES, explainCodes, explainSimulation, fetchStablecoinSignals, mergeAssetLists,
   parseHorizonAccount, parseSignedTx, planExecution, receivedAmount, resultCodes, Router, routeKey, sacId, scoreStablecoin, SOROSWAP_ROUTER,
 } from "../src/index.js";
@@ -261,6 +261,61 @@ describe("asset lists", () => {
     down = true;
     const all = createAssetList({ sources: [{ name: "A", url: "https://l.test/a" }], fetchImpl: f });
     expect((await all.get()).assets.map((a) => a.code)).toEqual(["XLM"]);
+  });
+});
+
+describe("cached name lookup", () => {
+  type Cb = (err: NodeJS.ErrnoException | null, address?: unknown, family?: number) => void;
+  const answer = (lookup: ReturnType<typeof createCachedLookup>, host: string, options: object = { all: true }) =>
+    new Promise<{ err: unknown; address: unknown }>((resolve) => lookup(host, options, (err, address) => resolve({ err, address })));
+
+  it("shares one request between concurrent lookups, then serves from memory", async () => {
+    let calls = 0;
+    const release: (() => void)[] = [];
+    const original = (_h: string, _o: object, cb: Cb) => { calls++; release.push(() => cb(null, [{ address: "1.2.3.4", family: 4 }])); };
+    const lookup = createCachedLookup(original);
+    const both = Promise.all([answer(lookup, "a.test"), answer(lookup, "a.test")]);
+    expect(calls).toBe(1);
+    release[0]!();
+    const [x, y] = await both;
+    expect(x.address).toEqual([{ address: "1.2.3.4", family: 4 }]);
+    expect(x.address).not.toBe(y.address); // each caller gets its own copy
+    expect((await answer(lookup, "a.test")).address).toEqual([{ address: "1.2.3.4", family: 4 }]);
+    expect(calls).toBe(1);
+    // A different name or a different question is a different lookup.
+    void answer(lookup, "b.test");
+    void answer(lookup, "a.test", { family: 4 });
+    expect(calls).toBe(3);
+  });
+
+  it("serves a stale answer at once while refreshing behind it, and never caches a failure", async () => {
+    let clock = 0;
+    let fail = true;
+    let ip = "1.1.1.1";
+    let calls = 0;
+    const original = (_h: string, _o: object, cb: Cb) => { calls++; queueMicrotask(() => (fail ? cb(Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" })) : cb(null, ip, 4))); };
+    const lookup = createCachedLookup(original, 1000, 10_000, () => clock);
+    expect((await answer(lookup, "a.test", {})).err).toBeTruthy();
+    fail = false;
+    expect((await answer(lookup, "a.test", {})).address).toBe("1.1.1.1"); // the failure was not remembered
+    expect(calls).toBe(2);
+    clock = 5000; // past the TTL, inside the stale window
+    ip = "2.2.2.2";
+    expect((await answer(lookup, "a.test", {})).address).toBe("1.1.1.1"); // old answer, immediately
+    expect(calls).toBe(3); // and a refresh was started
+    await new Promise((r) => setTimeout(r, 0));
+    expect((await answer(lookup, "a.test", {})).address).toBe("2.2.2.2");
+    clock = 50_000; // past the stale window: wait for a fresh answer
+    ip = "3.3.3.3";
+    expect((await answer(lookup, "a.test", {})).address).toBe("3.3.3.3");
+  });
+
+  it("accepts the callback-only and numeric-family call shapes Node uses", async () => {
+    const seen: object[] = [];
+    const lookup = createCachedLookup((_h: string, o: object, cb: Cb) => { seen.push(o); cb(null, "9.9.9.9", 4); });
+    await new Promise<void>((r) => lookup("a.test", (() => r()) as never));
+    await new Promise<void>((r) => lookup("a.test", 4, () => r()));
+    expect(seen).toEqual([{}, { family: 4 }]);
   });
 });
 

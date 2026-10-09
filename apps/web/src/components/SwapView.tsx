@@ -56,6 +56,9 @@ export function SwapView({ assets, account, stable, flow }: Props) {
   const quote = useQuote(valid ? { assetIn, assetOut, amount, slippageBps, atomicOnly: !twoStep } : null, flow.active);
   const routes = quote.data?.routes ?? [];
   const best = routes[0];
+  // No routes because no venue answered (a cold connection, an outage) is not the same as no route existing:
+  // the quote is being asked again, so keep showing that rather than telling the user there is no route.
+  const silent = routes.length === 0 && quote.data?.partial === true;
   // The user's pick holds across refreshes while that route still exists; otherwise the best route is used.
   const selected: RouteQuote | undefined = routes.find((r) => r.key === chosenKey) ?? best;
 
@@ -96,7 +99,7 @@ export function SwapView({ assets, account, stable, flow }: Props) {
   else if (!amount) action = { label: "Enter an amount" };
   else if (!valid) action = { label: "Amount needs up to 7 decimals" };
   else if (short) action = { label: `Not enough ${assetCode(assetIn)}` };
-  else if (quote.loading) action = { label: "Quoting every venue…", busy: true };
+  else if (quote.loading || silent) action = { label: "Quoting every venue…", busy: true };
   else if (!selected) action = { label: "No route for this pair and size" };
   else action = { label: `Review swap on ${selected.legs.map((l) => venueName(l.venue)).join(" then ")}`, onClick: start };
 
@@ -222,6 +225,14 @@ export function SwapView({ assets, account, stable, flow }: Props) {
           <FlowPanel flow={flow} backLabel="Back to routes" />
         ) : !valid ? (
           <Explainer />
+        ) : silent ? (
+          <Bezel core="p-7" className="animate-rise">
+            <h2 className="text-xl font-medium tracking-tight">The venues have not answered yet</h2>
+            <p className="mt-2 max-w-[56ch] text-sm text-muted">
+              None of {quote.data!.errors.map((e) => venueName(e.source)).join(", ")} replied in time. This usually clears in a few seconds; the quote is being asked again automatically.
+            </p>
+            <div className="mt-5"><LinkButton onClick={quote.reload} disabled={quote.refreshing}>{quote.refreshing ? "Asking again…" : "Ask again now"}</LinkButton></div>
+          </Bezel>
         ) : quote.loading ? (
           <div className="space-y-3" aria-busy="true" aria-label="Loading routes">
             <div className="skeleton h-36 rounded-3xl" />

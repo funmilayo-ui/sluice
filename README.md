@@ -20,7 +20,7 @@ Mainnet only. Non-custodial: the server builds and simulates transactions and re
 pnpm install
 pnpm build                         # packages, then the web app into apps/web/dist
 pnpm start                         # API and web app on http://localhost:8787
-pnpm test                          # 151 TypeScript tests (core 67, api 45, sdk 12, web 27)
+pnpm test                          # 154 TypeScript tests (core 70, api 45, sdk 12, web 27)
 PW_CHANNEL=chrome pnpm e2e         # 12 browser checks on desktop and phone, against live mainnet data
 pnpm w0:testnet-flow               # settles real testnet swaps with throwaway keys (post-signature path)
 cd contracts && cargo test         # 13 contract tests
@@ -69,6 +69,7 @@ Cross-layer routes are two transactions. `/v1/build` pre-builds leg 1 only; afte
 - Asset icons load from the hosts the public lists name. Some refuse embedding; the app shows the asset's initials instead.
 - Ranking: a two-transaction route must beat the best atomic route by about 50 bps (`twoStepPenaltyBps`) to rank first. That is a policy default, not derived.
 - Not built: split routing across venues, Sushi V3 and Aquarius CLMM specifics.
+- The first quote after the server starts is the slowest (new connections to five venues), and on a host with a slow name resolver it can come back with venues missing. The server caches name lookups in the process and resolves its upstream hosts at start; the web app says when venues have not answered and asks again by itself.
 - The public RPC endpoint has unknown rate limits and each quote makes about 10 to 20 calls. Set `RPC_URL` to your own provider before real traffic.
 
 ## Deploy
