@@ -240,7 +240,7 @@ Wallet popup wording (copy it exactly):
 
 | Wallet | Title | Buttons | How `amount_in` / `min_out` / addresses are shown | Mentions a fee? | Network named |
 |---|---|---|---|---|---|
-| Freighter | | | | | |
+| Freighter / Varial (kit 2.8.0) | "Confirm Authorizations", site `localhost`, fields Wallet (`GBFI…SJHM`), Network ("Test Net"), Authorizations | Cancel, Confirm | As pasted by the tester, the Authorizations section lists only the function names `fill` and `transfer`; no amounts or addresses appear in the pasted text (the tester may have collapsed or omitted detail). That order needed no trustline, so no `trust` call is expected. | Not in the pasted text | Test Net |
 | Freighter Mobile (WalletConnect) | | | | | |
 | Hana | | | | | |
 | xBull (tier 2) | | | | | |
