@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { cacheDnsLookups, createStablecoinScorer, DEFAULT_ASSET_LISTS, preferIpv4, preResolve, Router, type KvCache } from "@sluice/core";
+import { ordersFromEnv } from "./orders/routes.js";
 import { createApp, DEFAULT_HUBS, DEFAULT_VAULTS, defaultDeps, defaultSources, type VaultConfig } from "./app.js";
 
 type Env = Record<string, string | undefined>;
@@ -72,7 +73,7 @@ export function createSluice(env: Env = process.env, extra: { cache?: KvCache; w
   // first quote's connections join these instead of starting their own; a cold lookup can take seconds.
   const venueHosts = [env.HORIZON_URL ?? "https://horizon.stellar.org", env.AQUARIUS_URL ?? "https://amm-api.aqua.network", env.RPC_URL ?? "https://mainnet.sorobanrpc.com"];
   void preResolve(venueHosts);
-  const app = createApp(router, deps, { routerContract, scorer, vaults: parseVaults(env.BLEND_POOLS), webDir: extra.webDir });
+  const app = createApp(router, deps, { routerContract, scorer, vaults: parseVaults(env.BLEND_POOLS), webDir: extra.webDir, orders: ordersFromEnv(env) });
 
   return {
     app,

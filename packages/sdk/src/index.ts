@@ -1,3 +1,6 @@
+import type { OrderFields, OrderStatusResponse, OrdersConfig, PrepareOrderResponse, SubmitOrderResponse } from "./orders.js";
+export * from "./orders.js";
+
 export interface RouteLeg {
   venue: string;
   layer: "classic" | "soroban";
@@ -211,5 +214,40 @@ export class Sluice {
 
   positions(account: string): Promise<PositionsResponse> {
     return this.request("/v1/positions", { query: { account } });
+  }
+
+  // --- Settlement orders (testnet prototype). See README "Settlement orders".
+
+  /** Whether this server offers settlement orders, on which network and with which contract and solver. Never rejects for a disabled server: check `enabled`. */
+  ordersConfig(): Promise<OrdersConfig> {
+    return this.request("/v1/orders/config");
+  }
+
+  /**
+   * Ask the server to price an order and prepare the user's authorisation entry. When `solverWillFill` is false
+   * nothing was prepared: show `explained` and `skipReasons`. Otherwise pass the result to `signOrder`.
+   */
+  prepareOrder(p: { account: string; assetIn: string; assetOut: string; amount: string; slippageBps?: number; validForSec?: number }): Promise<PrepareOrderResponse> {
+    return this.request("/v1/orders/prepare", { body: p });
+  }
+
+  /** Hand over the entry `signOrder` returned. The solver then submits the fill; poll `order(hash)`. */
+  submitOrder(p: { orderId: string; order: OrderFields; signedAuthEntry: string }): Promise<SubmitOrderResponse> {
+    return this.request("/v1/orders/submit", { body: p });
+  }
+
+  order(hash: string): Promise<OrderStatusResponse> {
+    return this.request(`/v1/orders/${hash}`);
+  }
+
+  /** Poll until the fill is in a ledger. Same contract as `waitForTx`. */
+  async waitForOrder(hash: string, o: { timeoutMs?: number; intervalMs?: number } = {}): Promise<OrderStatusResponse> {
+    const deadline = Date.now() + (o.timeoutMs ?? 90_000);
+    for (;;) {
+      const t = await this.order(hash);
+      if (t.status !== "NOT_FOUND") return t;
+      if (Date.now() >= deadline) throw new SluiceError(408, "order not found in a ledger yet");
+      await new Promise((r) => setTimeout(r, o.intervalMs ?? 1500));
+    }
   }
 }

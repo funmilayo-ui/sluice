@@ -29,6 +29,7 @@ import {
   type Route,
 } from "@sluice/core";
 import { ACCOUNT_NOT_FOUND, defaultDeps, type Deps } from "./deps.js";
+import { ORDERS_DISABLED, registerOrderRoutes, type OrdersWiring } from "./orders/routes.js";
 
 export { defaultDeps, type Deps } from "./deps.js";
 
@@ -92,6 +93,8 @@ export interface AppOpts {
   vaults?: VaultConfig[];
   /** Directory holding the built web app (index.html and assets). Omit when a CDN serves it. */
   webDir?: string;
+  /** Settlement orders (testnet prototype). Omit and `/v1/orders/*` answers that the feature is off. */
+  orders?: OrdersWiring;
 }
 
 /**
@@ -511,6 +514,9 @@ export function createApp(router: Router, overrides: Partial<Deps> = {}, opts: A
     }
     return c.json({ error: "no route could be built" }, 404);
   });
+
+  // Settlement orders live beside the mainnet routes and share nothing with them: their own network, RPC and keys.
+  registerOrderRoutes(app, opts.orders ?? ORDERS_DISABLED);
 
   // The built web app, when this process is the one serving it. Registered last so it only sees paths no
   // API route claimed. Only known file types, only inside the directory.

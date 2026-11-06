@@ -98,3 +98,52 @@ export function explainSimulation(raw: string, venue?: "blend"): Explained {
   }
   return { code: "SIMULATION_FAILED", message: "The venue rejected this swap in simulation, so it was not offered for signing. Nothing was sent.", detail };
 }
+
+/** Settlement contract error numbers (`contracts/settle/src/lib.rs`, enum `Error`), in words a user can act on. */
+const SETTLE: Record<number, [code: string, message: string]> = {
+  1: ["BAD_AMOUNT", "The order has a zero or negative amount, or the solver offered less than the minimum you signed for."],
+  2: ["SAME_TOKEN", "The order sells and buys the same asset."],
+  3: ["EXPIRED", "The order's deadline has passed. Prepare a new order."],
+  4: ["BAD_SOLVER", "The order cannot be filled by the account that tried to fill it."],
+  5: ["BELOW_MIN_OUT", "The solver's payment would leave you with less than the minimum you signed for, so the contract refused it."],
+};
+
+/** The contract's own explanation for a settlement error number, or null for a number it does not define. */
+export function explainSettleCode(n: number): Explained | null {
+  const hit = SETTLE[n];
+  return hit ? { code: hit[0], message: `${hit[1]} Nothing moved.`, detail: `settle contract error #${n}` } : null;
+}
+
+/** The settle contract error number in a diagnostic log, taking only errors raised by `settleContract` when it is given. */
+export function settleErrorNumber(raw: string, settleContract?: string): number | null {
+  for (const m of raw.matchAll(/contract:(C[A-Z2-7]{55}), topics:\[error, Error\(Contract, #(\d+)\)\]/g)) {
+    if (!settleContract || m[1] === settleContract) return Number(m[2]);
+  }
+  // Without events, the first line is all there is ("HostError: Error(Contract, #5)"), and only the caller knows whose it is.
+  if (!settleContract) return null;
+  const first = /Error\(Contract, #(\d+)\)/.exec(raw.split("\n")[0] ?? "");
+  return first && SETTLE[Number(first[1])] && !/contract:C/.test(raw) ? Number(first[1]) : null;
+}
+
+/**
+ * Explain a failed simulation of `settle.fill`. Settlement contract errors first, then authorization errors
+ * (a signature that does not cover this order, one already used, one that has expired), then the token
+ * balance errors `explainSimulation` knows.
+ */
+export function explainFill(raw: string, settleContract?: string): Explained {
+  const detail = (raw.split("\n")[0] ?? "").slice(0, 200);
+  const n = settleErrorNumber(raw, settleContract);
+  const settle = n === null ? null : explainSettleCode(n);
+  if (settle) return { ...settle, detail };
+  if (/Error\(Auth, ExistingValue\)/.test(raw)) {
+    return { code: "ALREADY_USED", message: "This signed order has already been used. Prepare a new one. Nothing moved.", detail };
+  }
+  if (/Error\(Auth, InvalidAction\)|signature expired|Error\(Auth, InvalidInput\)/i.test(raw)) {
+    return { code: "BAD_SIGNATURE", message: "The signature does not match this order, or it has expired. Prepare a new order and sign again. Nothing moved.", detail };
+  }
+  const generic = explainSimulation(raw);
+  if (generic.code === "SIMULATION_FAILED") {
+    return { code: "SIMULATION_FAILED", message: "The settlement was rejected in simulation, so nothing was sent.", detail };
+  }
+  return generic;
+}
