@@ -1,0 +1,29 @@
+name: Feature or venue request
+description: Propose a new venue, endpoint or behaviour
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can a user not do today? Check "Honest limits" and "Not built" in the README first.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: For a venue, name the contract or API and how a swap is executed on it. For a ranking change, say why the current policy is wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Links to contract addresses, docs, or a mainnet simulation that shows the approach works.
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contributing
+      options:
+        - label: I would like to work on this myself
