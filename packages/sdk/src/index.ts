@@ -1,4 +1,4 @@
-import type { OrderFields, OrderStatusResponse, OrdersConfig, PrepareOrderResponse, SubmitOrderResponse } from "./orders.js";
+import type { OrderFields, OrderStatusResponse, OrdersConfig, PrepareOrderResponse, PrepareOrderTxResponse, SubmitOrderResponse } from "./orders.js";
 export * from "./orders.js";
 
 export interface RouteLeg {
@@ -229,6 +229,20 @@ export class Sluice {
    */
   prepareOrder(p: { account: string; assetIn: string; assetOut: string; amount: string; slippageBps?: number; validForSec?: number }): Promise<PrepareOrderResponse> {
     return this.request("/v1/orders/prepare", { body: p });
+  }
+
+  /**
+   * Tier 2, for a wallet that can sign a transaction but not an authorisation entry: prices the order and returns a transaction
+   * sourced from the user's account, with the solver's authorisation already signed. Same refusals and `solverWillFill: false` shape as
+   * `prepareOrder`. Check `ordersConfig().signing.tiers` includes "tx" first. Pass the result to `signOrderTx`.
+   */
+  prepareOrderTx(p: { account: string; assetIn: string; assetOut: string; amount: string; slippageBps?: number; validForSec?: number }): Promise<PrepareOrderTxResponse> {
+    return this.request("/v1/orders/prepare-tx", { body: p });
+  }
+
+  /** Hand over the transaction `signOrderTx` returned. The server verifies it and has it sent; poll `order(hash)`. The user pays the fee. */
+  submitOrderTx(p: { orderId: string; order: OrderFields; signedTx: string }): Promise<SubmitOrderResponse> {
+    return this.request("/v1/orders/submit-tx", { body: p });
   }
 
   /** Hand over the entry `signOrder` returned. The solver then submits the fill; poll `order(hash)`. */

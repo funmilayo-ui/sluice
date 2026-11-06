@@ -1,86 +1,71 @@
 import { describe, expect, it } from "vitest";
-import { Account, Address, Keypair, Networks, nativeToScVal, rpc, StrKey, xdr } from "@stellar/stellar-sdk";
+import { Account, Networks, nativeToScVal, rpc, SorobanDataBuilder, xdr } from "@stellar/stellar-sdk";
 import { randomBytes } from "node:crypto";
-import { decodeOrder } from "@sluice/solver";
+import { StrKey } from "@stellar/stellar-sdk";
+import { FillSimulationError } from "@sluice/solver";
 import { contractErrorOf, defaultOrdersDeps } from "./deps.js";
-import { FillSimulationError } from "./service.js";
 import { config, recordedEntry, settle, solverKp, user, wallet } from "./fixtures.js";
 
 const order = { user: user.publicKey(), tokenIn: StrKey.encodeContract(randomBytes(32)), amountIn: 100n, tokenOut: StrKey.encodeContract(randomBytes(32)), minOut: 90n, deadline: 2_000_000_000, createTrustline: true };
 
-/** An RPC client that records what it is asked and answers like the network would. */
+/** An RPC client that records what it is asked and answers like the network would. It has no way to send: the API never sends fills. */
 function fakeServer(over: { simError?: string } = {}) {
   const sims: xdr.SorobanAuthorizationEntry[][] = [];
-  const sent: string[] = [];
-  let seq = 41n;
+  const sources: string[] = [];
   const rec = recordedEntry(order);
   const server = {
-    getAccount: async () => new Account(solverKp.publicKey(), seq.toString()),
+    getAccount: async (id: string) => new Account(id, "41"),
     getNetwork: async () => ({ passphrase: Networks.TESTNET }),
     getLatestLedger: async () => ({ sequence: 500 }),
     simulateTransaction: async (tx: any) => {
       sims.push(tx.toEnvelope().v1().tx().operations()[0].body().invokeHostFunctionOp().auth());
+      sources.push(tx.source);
       if (over.simError) return { error: over.simError, id: "1", latestLedger: 1, events: [], _parsed: true };
-      return { id: "1", latestLedger: 1, events: [], _parsed: true, result: { auth: sims.at(-1)!.length === 0 ? [rec] : sims.at(-1), retval: nativeToScVal(1n) }, minResourceFee: "12345", transactionData: new (await import("@stellar/stellar-sdk")).SorobanDataBuilder() };
-    },
-    sendTransaction: async (tx: any) => {
-      sent.push(tx.toXDR());
-      seq = BigInt(tx.sequence);
-      return { status: "PENDING", hash: "ab".repeat(32), latestLedger: 1, latestLedgerCloseTime: 1 };
+      return { id: "1", latestLedger: 1, events: [], _parsed: true, result: { auth: sims.at(-1)!.length === 0 ? [rec] : sims.at(-1), retval: nativeToScVal(1n) }, minResourceFee: "12345", transactionData: new SorobanDataBuilder() };
     },
   };
-  return { server: server as unknown as rpc.Server, sims, sent, rec, setSeq: (n: bigint) => (seq = n) };
+  return { server: server as unknown as rpc.Server, sims, sources, rec };
 }
 
 describe("default orders deps", () => {
+  it("is built from the solver's PUBLIC address: the config carries no secret in remote mode and the deps still work", async () => {
+    const f = fakeServer();
+    const remote = { ...config, solver: { mode: "remote" as const, url: "http://solver.test", token: "t".repeat(32) } };
+    const deps = defaultOrdersDeps(remote, { server: f.server });
+    const sim = await deps.simulateFill(order, 95n);
+    expect(sim.minResourceFee).toBe(12345n);
+    expect(f.sources[0]).toBe(solverKp.publicKey());
+    expect(JSON.stringify(remote, (_k, v) => (typeof v === "bigint" ? v.toString() : v))).not.toContain(solverKp.secret());
+  });
   it("records the user's entry by simulating fill(order, solver, amount_out) with the solver as source", async () => {
     const f = fakeServer();
     const deps = defaultOrdersDeps(config, { server: f.server });
     const sim = await deps.simulateFill(order, 95n);
     expect(sim.userEntry).toBe(f.rec);
     expect(sim.minResourceFee).toBe(12345n);
-    await expect(sim.send()).rejects.toThrow(/recording/);
+    expect("send" in sim).toBe(false);
   });
   it("throws FillSimulationError with the raw RPC error when the simulation fails", async () => {
     const deps = defaultOrdersDeps(config, { server: fakeServer({ simError: "HostError: Error(Contract, #5)\nmore" }).server });
     await expect(deps.simulateFill(order, 95n)).rejects.toBeInstanceOf(FillSimulationError);
     await expect(deps.simulateFill(order, 95n)).rejects.toThrow(/Error\(Contract, #5\)\nmore/);
   });
-  it("enforces with the user's signed entry in place of the recorded one, signs as the solver and sends the next sequence", async () => {
+  it("enforces with the user's signed entry in place of the recorded one", async () => {
     const f = fakeServer();
     const deps = defaultOrdersDeps(config, { server: f.server });
     const recorded = (await deps.simulateFill(order, 95n)).userEntry;
     const signed = xdr.SorobanAuthorizationEntry.fromXDR(await wallet({ authEntry: { xdr: recorded.toXDR("base64"), validUntilLedger: 600 } }), "base64");
-    const sim = await deps.simulateFill(order, 95n, signed);
+    await deps.simulateFill(order, 95n, signed);
     expect(f.sims.at(-1)![0]!.toXDR("base64")).toBe(signed.toXDR("base64"));
-    const r = await sim.send();
-    expect(r).toMatchObject({ status: "PENDING", hash: "ab".repeat(32) });
-    const { TransactionBuilder } = await import("@stellar/stellar-sdk");
-    const tx = TransactionBuilder.fromXDR(f.sent[0]!, Networks.TESTNET) as any;
-    expect(tx.source).toBe(solverKp.publicKey());
-    expect(tx.sequence).toBe("42");
-    expect(tx.signatures).toHaveLength(1);
-    expect(Keypair.fromPublicKey(solverKp.publicKey()).verify(tx.hash(), tx.signatures[0].signature())).toBe(true);
-    const op = tx.operations[0];
-    expect(op.func.invokeContract().functionName().toString()).toBe("fill");
-    expect(Address.fromScAddress(op.func.invokeContract().contractAddress()).toString()).toBe(settle);
-    const args = op.func.invokeContract().args();
-    expect(decodeOrder(args[0]!)).toEqual(order);
-    expect(Address.fromScVal(args[1]!).toString()).toBe(solverKp.publicKey());
-    expect(args[2]!.i128().lo().toString()).toBe("95");
   });
-  it("hands out consecutive sequence numbers while the node still reports the old one", async () => {
+  it("reads a user's sequence number and simulates a signed transaction as it is", async () => {
     const f = fakeServer();
     const deps = defaultOrdersDeps(config, { server: f.server });
-    const signed = xdr.SorobanAuthorizationEntry.fromXDR(await wallet({ authEntry: { xdr: f.rec.toXDR("base64"), validUntilLedger: 600 } }), "base64");
-    const one = await deps.simulateFill(order, 95n, signed);
-    const two = await deps.simulateFill(order, 96n, signed);
-    f.setSeq(41n); // the node has not counted either transaction yet
-    await one.send();
-    f.setSeq(41n);
-    await two.send();
-    const { TransactionBuilder } = await import("@stellar/stellar-sdk");
-    expect(f.sent.map((x) => (TransactionBuilder.fromXDR(x, Networks.TESTNET) as any).sequence)).toEqual(["42", "43"]);
+    expect(await deps.accountSequence(user.publicKey())).toBe("41");
+    const { userTx } = await import("./fixtures.js");
+    const t = await userTx(order, 95n);
+    expect((await deps.simulateTx(t.tx)).minResourceFee).toBe(12345n);
+    expect(f.sources.at(-1)).toBe(user.publicKey());
   });
   it("reads the network the RPC serves and the latest ledger", async () => {
     const deps = defaultOrdersDeps(config, { server: fakeServer().server });

@@ -13,13 +13,18 @@ export interface MacInput {
   nonce: string;
   /** The auth entry's expiration ledger. */
   validUntilLedger: number;
+  /**
+   * `tx` for the user-sourced transaction tier. Part of the MAC, so an id prepared for one tier cannot be replayed on the other:
+   * there the nonce and expiry are the SOLVER's authorisation entry's, not the user's.
+   */
+  tier?: "tx";
 }
 
 function digest(secret: string, i: MacInput): Buffer {
   const o = i.order;
   // JSON of a fixed-order array: no field can be smuggled into a neighbour by choosing a separator.
   const canonical = JSON.stringify([
-    "sluice-order-v1", i.passphrase, i.settleContract, i.solver,
+    i.tier === "tx" ? "sluice-order-tx-v1" : "sluice-order-v1", i.passphrase, i.settleContract, i.solver,
     o.user, o.tokenIn, o.amountIn.toString(), o.tokenOut, o.minOut.toString(), o.deadline, o.createTrustline,
     i.amountOut.toString(), i.nonce, i.validUntilLedger,
   ]);

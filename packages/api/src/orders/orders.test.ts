@@ -75,7 +75,7 @@ describe("mainnet guard", () => {
   });
   it("a service cannot be built for the public network, even from a hand-made config", () => {
     expect(() => assertNotMainnet(Networks.PUBLIC)).toThrow(MainnetRefused);
-    expect(() => createOrdersService({ ...config, networkPassphrase: Networks.PUBLIC }, fake().deps)).toThrow(/testnet-only/);
+    expect(() => createOrdersService({ ...config, networkPassphrase: Networks.PUBLIC }, fake().deps, fake().solver)).toThrow(/testnet-only/);
   });
   it("serves 501 with its own explained code on every route when built from a mainnet environment", async () => {
     const app = createApp(new Router({ sources: [], hubs: [] }), {}, { orders: ordersFromEnv({ ...complete, ORDERS_NETWORK_PASSPHRASE: Networks.PUBLIC }) });
@@ -108,7 +108,7 @@ describe("ordersFromEnv", () => {
     const on = ordersFromEnv({
       ORDERS_SETTLE_CONTRACT: settle, ORDERS_RPC_URL: "https://rpc.test", ORDERS_HORIZON_URL: "https://horizon.test",
       ORDERS_NETWORK_PASSPHRASE: Networks.TESTNET, ORDERS_SOLVER_SECRET: solverKp.secret(), ORDERS_MAC_SECRET: "0123456789abcdef0123",
-    });
+    }, { log: () => undefined });
     expect(on.enabled).toBe(true);
     const app = createApp(new Router({ sources: [], hubs: [] }), {}, { orders: on });
     expect(await json(await app.request("/v1/orders/config"))).toMatchObject({ enabled: true, network: "testnet", solver: solverKp.publicKey() });
@@ -293,31 +293,17 @@ describe("POST /v1/orders/submit", () => {
     expect(last.amountOut).toBe(BigInt(p.summary.expected.replace(".", "")));
     expect(t.state.sent).toBe(1);
   });
-  it("hedges after the fill lands and reports it on the order", async () => {
+  it("hands the fill to the solver together with the signed entry and what the API's quote said, and keeps no hedge state itself", async () => {
     const { t, p, signed } = await prepared();
     await t.post("/v1/orders/submit", body(p, signed));
-    expect(t.service.hedgeOf(HASH)).toMatchObject({ status: "PENDING" });
-    t.state.tx = { hash: HASH, status: "SUCCESS", ledger: 5 };
-    await t.service.idle();
-    expect(t.state.hedged).toBe(1);
-    expect(t.service.hedgeOf(HASH)).toEqual({ status: "HEDGED", hash: "cd".repeat(32), received: "104.0000000" });
-  });
-  it("does not hedge a fill that failed, and records UNHEDGED (calling the recovery seam) when the hedge fails", async () => {
-    const failed = await prepared();
-    await failed.t.post("/v1/orders/submit", body(failed.p, failed.signed));
-    failed.t.state.tx = { hash: HASH, status: "FAILED", codes: ["txFailed"] };
-    await failed.t.service.idle();
-    expect(failed.t.state.hedged).toBe(0);
-    expect(failed.t.service.hedgeOf(HASH)).toMatchObject({ status: "NOT_NEEDED" });
-
-    const calls: unknown[] = [];
-    const bad = await prepared(build({ hedgeError: "hedge not accepted: txBadSeq" }, { onUnhedged: (c) => void calls.push(c) }));
-    await bad.t.post("/v1/orders/submit", body(bad.p, bad.signed));
-    bad.t.state.tx = { hash: HASH, status: "SUCCESS" };
-    await bad.t.service.idle();
-    expect(bad.t.service.hedgeOf(HASH)).toMatchObject({ status: "UNHEDGED", error: "hedge not accepted: txBadSeq" });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ fillHash: HASH, error: "hedge not accepted: txBadSeq" });
+    expect(t.state.fills).toHaveLength(1);
+    const f = t.state.fills[0]!;
+    expect(f.signedUserEntry).toBe(signed);
+    expect(f.assetIn).toBe(A);
+    expect(f.assetOut).toBe(C);
+    expect(f.amountOut).toBe(BigInt(p.summary.expected.replace(".", "")));
+    expect(f.quoteOut).toBe((100n * S * 105n) / 100n);
+    expect("hedgeOf" in t.service).toBe(false);
   });
 
   it.each([
@@ -442,7 +428,6 @@ describe("POST /v1/orders/submit", () => {
     const b = await prepared();
     b.t.state.sendResult = { hash: HASH, status: "TRY_AGAIN_LATER" };
     expect((await b.t.post("/v1/orders/submit", body(b.p, b.signed))).status).toBe(503);
-    expect(a.t.service.hedgeOf(HASH)).toBeUndefined();
   });
   it.each([
     ["no body", "{"],
@@ -502,7 +487,7 @@ describe("GET /v1/orders/:hash", () => {
     expect((await t.app.request("/v1/orders/zzz")).status).toBe(400);
     const f = fake();
     f.deps.getTx = async () => { throw new Error("rpc down\nstack"); };
-    const svc = createOrdersService(config, f.deps);
+    const svc = createOrdersService(config, f.deps, f.solver);
     const app = createApp(new Router({ sources: [], hubs: [] }), {}, { orders: { enabled: true, service: svc } });
     const r = await app.request(`/v1/orders/${HASH}`);
     expect(r.status).toBe(502);

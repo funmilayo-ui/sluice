@@ -41,7 +41,9 @@ export function builtWebDir(): string | undefined {
 
 /**
  * Wire the app from environment variables. Shared by the Node server and the serverless entry so both run
- * the same configuration. Nothing here starts a timer: scores and pool lists refresh when a request needs them.
+ * the same configuration. Nothing here starts a timer: scores and pool lists refresh when a request needs them. The one
+ * exception is opt-in: `start()` restores an in-process solver's stored state and starts its recovery loop (a stoppable,
+ * unref'd timer). Only the long-lived Node server calls it; the serverless entry does not, and should use a remote solver.
  */
 export function createSluice(env: Env = process.env, extra: { cache?: KvCache; webDir?: string } = {}) {
   // Some hosts have a broken IPv6 route, which makes fetch time out where curl works.
@@ -73,10 +75,23 @@ export function createSluice(env: Env = process.env, extra: { cache?: KvCache; w
   // first quote's connections join these instead of starting their own; a cold lookup can take seconds.
   const venueHosts = [env.HORIZON_URL ?? "https://horizon.stellar.org", env.AQUARIUS_URL ?? "https://amm-api.aqua.network", env.RPC_URL ?? "https://mainnet.sorobanrpc.com"];
   void preResolve(venueHosts);
-  const app = createApp(router, deps, { routerContract, scorer, vaults: parseVaults(env.BLEND_POOLS), webDir: extra.webDir, orders: ordersFromEnv(env) });
+  const orders = ordersFromEnv(env);
+  const app = createApp(router, deps, { routerContract, scorer, vaults: parseVaults(env.BLEND_POOLS), webDir: extra.webDir, orders });
 
   return {
     app,
+    /**
+     * Begin background work that needs a long-lived process: with an in-process solver, load its stored state (open positions
+     * and the circuit breaker come back as they were) and start retrying failed hedges. Nothing to do with a remote solver,
+     * which does this itself. Await it before serving traffic.
+     */
+    async start(): Promise<void> {
+      if (orders.enabled) await orders.background?.start();
+    },
+    /** Stop the background loop. Does not cancel a hedge already in flight; its hash is saved, so the next process finishes the story. */
+    async stop(): Promise<void> {
+      if (orders.enabled) await orders.background?.stop();
+    },
     /**
      * Load what the first visitor would otherwise wait for. Safe to call and forget. In order of what a
      * visitor needs first: the asset list (three small fetches), then the heavier pool discovery and scoring.

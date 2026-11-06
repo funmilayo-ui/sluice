@@ -1,14 +1,18 @@
-import { Address, Keypair, xdr } from "@stellar/stellar-sdk";
+import { Address, xdr } from "@stellar/stellar-sdk";
 import {
-  explainCodes, explainFill, explainSettleCode, formatAmount, parseAmount, sacId, type Explained, type SubmitResult, type TxStatus,
+  explainCodes, explainFill, explainSettleCode, formatAmount, parseAmount, sacId, type Explained, type TxStatus,
 } from "@sluice/core";
 import {
-  evaluateFill, feeToOut, type ClassicPair, type Decision, type Order, type QuotedHedge, type SkipReason, type SolverParams,
+  evaluateFill, feeToOut, FillSimulationError, SolverUnavailable, type ClassicPair, type Decision, type FillOutcome, type HedgeView, type Order,
+  type QuotedHedge, type RefusalReason, type SolverParams, type SolverPort,
 } from "@sluice/solver";
 import { ACCOUNT_NOT_FOUND } from "../deps.js";
 import { buildPreimage, checkSignature, isAddressEntry, reviewEntry, withExpiration } from "./auth.js";
 import { assertNotMainnet, isPublicNetwork, networkName, type OrdersConfig } from "./config.js";
 import { makeOrderId, verifyOrderId } from "./mac.js";
+import { inspectUserTx, isProblem, parseUserTx, solverEntryOf, type TxContext } from "./txTier.js";
+
+export { FillSimulationError };
 
 const ACCOUNT = /^G[A-Z2-7]{55}$/;
 const ASSET = /^(native|[A-Za-z0-9]{1,12}:G[A-Z2-7]{55})$/;
@@ -35,30 +39,23 @@ export interface OrderFields {
   createTrustline: boolean;
 }
 
-export type HedgeStatus =
-  | { status: "PENDING" }
-  | { status: "HEDGING" }
-  | { status: "HEDGED"; hash: string; received?: string }
-  | { status: "UNHEDGED"; error: string; hash?: string }
-  | { status: "NOT_NEEDED"; reason: string };
+/**
+ * The solver's hedge for a fill, as `GET /v1/orders/:hash` reports it (see `HedgeView` in @sluice/solver for each state).
+ * `UNKNOWN` is this server's own: the solver could not be asked. The user-facing fill status never depends on any of it.
+ */
+export type HedgeStatus = HedgeView | { status: "UNKNOWN"; reason: string };
 
-export interface HedgeOutcome { hash?: string; received?: bigint; error?: string }
-
-/** A transaction as `GET /v1/orders/:hash` needs it: the usual status, plus the settle contract's error number when the fill failed with one. */
-export interface OrderTx extends TxStatus { contractError?: number }
-
-/** A recorded or enforced simulation of `fill`. `send` signs as the solver and submits exactly what was simulated. */
+/** A recorded or enforced simulation of `fill`: the authorisation the user must give (or has given) and what the network will charge. */
 export interface FillSimulation {
   /** The user's authorisation entry: unsigned when recorded, as given when `signedUser` was passed. */
   userEntry: xdr.SorobanAuthorizationEntry;
   minResourceFee: bigint;
-  send(): Promise<SubmitResult>;
 }
 
-/** Thrown by `simulateFill` when the network refuses the simulation. `message` is the raw RPC error (all lines). */
-export class FillSimulationError extends Error {}
-
-/** Everything the service reads from or sends to the network. Injectable, so tests never leave the process. */
+/**
+ * Everything the service reads from the network. Injectable, so tests never leave the process. Nothing here signs or sends
+ * as the solver: that is the `SolverPort`'s job.
+ */
 export interface OrdersDeps {
   now(): number;
   /** The network passphrase the RPC endpoint itself reports. */
@@ -69,20 +66,17 @@ export interface OrdersDeps {
   /** The solver's balance of `asset`, in stroops. */
   solverBalance(asset: string): Promise<bigint>;
   hedgeQuote(order: Order, pair: ClassicPair): Promise<QuotedHedge | null>;
+  /** Tier 1. Throws `FillSimulationError` when the network refuses. */
   simulateFill(order: Order, amountOut: bigint, signedUser?: xdr.SorobanAuthorizationEntry): Promise<FillSimulation>;
+  /** Tier 2: simulate the exact transaction the user signed. Throws `FillSimulationError`. */
+  simulateTx(tx: import("@stellar/stellar-sdk").Transaction): Promise<{ minResourceFee: bigint }>;
+  /** The account's current sequence number (tier 2: the signed transaction must use the next one). */
+  accountSequence(account: string): Promise<string>;
   getTx(hash: string): Promise<OrderTx>;
-  /** Sell the filled input on the Classic DEX. Throws on failure. */
-  hedge(order: Order, pair: ClassicPair, amountOut: bigint): Promise<HedgeOutcome>;
 }
 
-/**
- * SEAM(recovery): called when a fill settled but the hedge did not, which leaves the solver holding the user's
- * `token_in` unhedged. A recovery module (retry, unwind, alert) plugs in here. Nothing is wired today: the
- * outcome is recorded as `UNHEDGED` in memory and nothing else happens.
- */
-export interface OrdersHooks {
-  onUnhedged?(ctx: { fillHash: string; order: Order; amountOut: bigint; error: string }): Promise<void> | void;
-}
+/** The transaction as `GET /v1/orders/:hash` needs it: the usual status, plus the settle contract's error number when the fill failed with one. */
+export interface OrderTx extends TxStatus { contractError?: number }
 
 export interface ServiceResult { status: number; body: Record<string, unknown> }
 const ok = (body: Record<string, unknown>): ServiceResult => ({ status: 200, body });
@@ -93,7 +87,8 @@ const fail = (status: number, error: string, explained?: Explained, extra: Recor
 const explain = (code: string, message: string, detail = ""): Explained => ({ code, message, detail });
 const firstLine = (s: string) => (s.split("\n")[0] ?? s).slice(0, 300);
 
-const SKIP_TEXT: Record<SkipReason, string> = {
+const SKIP_TEXT: Record<RefusalReason, string> = {
+  circuit_breaker: "The solver has paused new orders: it is holding a position it could not sell yet, and will not take on more until that is resolved.",
   invalid_order: "The order is not valid.",
   deadline_too_close: "There is too little time left on this order for the solver to fill and hedge it.",
   order_too_large: "This is larger than the solver will take on in one order.",
@@ -105,7 +100,7 @@ const SKIP_TEXT: Record<SkipReason, string> = {
   hedge_below_amount_out: "The Classic market pays less for this than the minimum the order would ask for.",
   below_min_profit: "After the solver's costs and its profit floor there is nothing left to pay out at this size.",
 };
-const skipExplained = (reasons: SkipReason[]): Explained =>
+const skipExplained = (reasons: RefusalReason[]): Explained =>
   explain("SOLVER_WILL_NOT_FILL", `No solver will fill this order now. ${reasons.map((r) => SKIP_TEXT[r]).join(" ")} Nothing was signed.`, reasons.join(", "));
 
 export function orderFields(o: Order, assetIn: string, assetOut: string): OrderFields {
@@ -149,32 +144,35 @@ export function parseOrderFields(v: unknown, passphrase: string): { order: Order
 }
 
 export interface OrdersServiceOpts {
-  hooks?: OrdersHooks;
-  /** How often the post-fill tracker polls for the fill to land. */
-  pollMs?: number;
-  /** Give up waiting for the fill after this long. */
-  fillWaitMs?: number;
+  /** Overridable for tests. */
+  ledgerSec?: number;
 }
 
-export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts: OrdersServiceOpts = {}) {
+/** What the pricing common to both signing tiers produced. */
+interface Priced {
+  order: Order;
+  assetIn: string;
+  assetOut: string;
+  amountIn: bigint;
+  minOut: bigint;
+  validFor: number;
+  decision: Extract<Decision, { action: "fill" }>;
+  hedge: QuotedHedge;
+}
+
+type SolverCall<T> = { ok: true; value: T } | { ok: false; result: ServiceResult };
+
+export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, solverPort: SolverPort, opts: OrdersServiceOpts = {}) {
   // Defence in depth: even a config object built by hand cannot start a service on the public network.
   assertNotMainnet(config.networkPassphrase);
-  const solver = Keypair.fromSecret(config.solverSecret).publicKey();
+  const solver = config.solverAddress;
+  if (solverPort.address !== solver) throw new Error("the solver port is a different solver than the configured address");
   const pass = config.networkPassphrase;
-  const pollMs = opts.pollMs ?? 1500;
-  const fillWaitMs = opts.fillWaitMs ?? 180_000;
-
-  /** Best-effort, in this process only. Bounded; the oldest entries go first. */
-  const hedges = new Map<string, HedgeStatus>();
-  const setHedge = (hash: string, s: HedgeStatus) => {
-    hedges.delete(hash);
-    hedges.set(hash, s);
-    while (hedges.size > 500) hedges.delete(hedges.keys().next().value as string);
-  };
-  const pending = new Set<Promise<void>>();
+  const LEDGER = opts.ledgerSec ?? LEDGER_SEC;
+  const txCtx: TxContext = { settleContract: config.settleContract, solver, passphrase: pass };
 
   let networkOk = false;
-  /** The RPC endpoint must really serve the configured, non-public network. Cached once it has. */
+  /** The RPC endpoint must really serve the configured, non-public network. Cached once it has. Needs only the network, never the solver. */
   async function ensureNetwork(): Promise<ServiceResult | null> {
     if (networkOk) return null;
     let reported: string;
@@ -193,6 +191,41 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
     return null;
   }
 
+  let solverOk = false;
+  /**
+   * The solver must be the one this server is configured for: same address, contract and network. Asked before any work that
+   * involves the solver, and cached once it matches. `GET /v1/orders/:hash` does NOT call this: the fill's status comes from the
+   * chain and must not depend on the solver being up.
+   */
+  async function ensureSolver(): Promise<ServiceResult | null> {
+    if (solverOk) return null;
+    const h = await viaSolver(() => solverPort.health());
+    if (!h.ok) return h.result;
+    if (h.value.address !== solver || h.value.settleContract !== config.settleContract || h.value.networkPassphrase !== pass) {
+      return fail(503, "the solver service is configured for another solver, contract or network", explain("ORDERS_SOLVER_MISMATCH", "Settlement orders are misconfigured on this deployment.", "solver service disagrees with ORDERS_* configuration"));
+    }
+    solverOk = true;
+    return null;
+  }
+
+  /** Call the solver; a solver that cannot be reached becomes a clean, explained 503 instead of a crash. */
+  async function viaSolver<T>(fn: () => Promise<T> | T): Promise<SolverCall<T>> {
+    try {
+      return { ok: true, value: await fn() };
+    } catch (e) {
+      if (e instanceof SolverUnavailable) {
+        const why: Record<string, string> = {
+          unreachable: "could not be reached", timeout: "did not answer in time", unauthorized: "refused this server's credentials", failed: "failed", bad_response: "sent an answer this server does not understand", mismatch: "is not the solver this server is configured for",
+        };
+        return {
+          ok: false,
+          result: fail(503, `the solver service ${why[e.reason] ?? "failed"}`, explain("SOLVER_UNAVAILABLE", `The solver is not available right now (it ${why[e.reason] ?? "failed"}), so no order can be filled. Nothing was signed; try again shortly.`, e.reason)),
+        };
+      }
+      return { ok: false, result: fail(502, firstLine((e as Error).message)) };
+    }
+  }
+
   const params = (nowMs: number, solverBalanceOut: bigint, networkFeeOut: bigint, improvementShareBps: number): SolverParams => ({
     nowMs,
     minDeadlineBufferSec: config.policy.minDeadlineBufferSec,
@@ -204,8 +237,9 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
     networkFeeOut,
     maxQuoteAgeSec: 60,
   });
-  const feeOut = (assetOut: string, resourceFee: bigint) => {
-    const stroops = resourceFee + 2n * BASE_FEE_STROOPS; // inclusion fee for the fill, and for the hedge payment
+  /** Tier 1: the solver pays the fill's fee and the hedge's. Tier 2 (`hedgeOnly`): the user pays the fill's fee. */
+  const feeOut = (assetOut: string, resourceFee: bigint, hedgeOnly = false) => {
+    const stroops = hedgeOnly ? BASE_FEE_STROOPS : resourceFee + 2n * BASE_FEE_STROOPS;
     return assetOut === "native" ? stroops : feeToOut(stroops, config.feeOutPerXlm);
   };
 
@@ -216,12 +250,15 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
       networkPassphrase: pass,
       settleContract: config.settleContract,
       solver,
-      signing: { credentials: "address-legacy" as const },
+      // `credentials` is what the auth-entry tier issues (unchanged). `tiers` lists every way a wallet can authorise an order:
+      // "auth-entry" (signAuthEntry, the user sends nothing) and "tx" (signTransaction, the user is the source and pays the fee).
+      signing: { credentials: "address-legacy" as const, tiers: ["auth-entry", "tx"] as const },
       limits: { maxOrderIn: formatAmount(config.policy.maxOrderIn), validForSec: { min: MIN_VALID_FOR_SEC, max: MAX_VALID_FOR_SEC, default: DEFAULT_VALID_FOR_SEC } },
     };
   }
 
-  async function prepare(b: Record<string, unknown>): Promise<ServiceResult> {
+  /** Everything `prepare` and `prepare-tx` share: validate, refuse up front when the solver is paused, price against the Classic book. */
+  async function priceOrder(b: Record<string, unknown>, tier: "auth-entry" | "tx"): Promise<ServiceResult | Priced> {
     const account = String(b.account ?? "");
     const assetIn = String(b.assetIn ?? "");
     const assetOut = String(b.assetOut ?? "");
@@ -248,8 +285,21 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
       return fail(400, "an asset issuer is not a valid account address");
     }
 
-    const refused = await ensureNetwork();
+    const refused = (await ensureNetwork()) ?? (await ensureSolver());
     if (refused) return refused;
+
+    const declined = (reasons: RefusalReason[], hedge: QuotedHedge | null, extra: Record<string, unknown> = {}): ServiceResult =>
+      ok({
+        solverWillFill: false,
+        skipReasons: reasons,
+        explained: skipExplained(reasons),
+        summary: { pay: formatAmount(amountIn), classicQuote: hedge ? formatAmount(hedge.quote.amountOut) : undefined, ...extra },
+      });
+
+    // The circuit breaker comes first: while the solver is holding a position it could not sell, nothing else is worth computing.
+    const open = await viaSolver(() => solverPort.canFill());
+    if (!open.ok) return open.result;
+    if (!open.value.ok) return declined(["circuit_breaker"], null);
 
     let trusted: Set<string>;
     try {
@@ -274,18 +324,12 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
     } catch (e) {
       return fail(502, firstLine((e as Error).message));
     }
-    const declined = (reasons: SkipReason[], extra: Record<string, unknown> = {}): ServiceResult =>
-      ok({
-        solverWillFill: false,
-        skipReasons: reasons,
-        explained: skipExplained(reasons),
-        summary: { pay: formatAmount(amountIn), classicQuote: hedge ? formatAmount(hedge.quote.amountOut) : undefined, ...extra },
-      });
 
-    // Price the solver's own costs with a recording simulation at a placeholder order (the fee barely depends on the amounts).
-    // Not possible without a hedge to pay for or inventory to pay out of: the evaluation below then says why it declines.
-    let fee = 0n;
-    if (hedge && balance > 0n) {
+    // Price the solver's own costs. Tier 1 records a simulation at a placeholder order (the fee barely depends on the amounts);
+    // tier 2 has the user pay the fill's fee, so the solver's only cost is the hedge. Not possible without a hedge to pay for or
+    // inventory to pay out of: the evaluation below then says why it declines.
+    let fee = feeOut(assetOut, 0n, tier === "tx");
+    if (tier === "auth-entry" && hedge && balance > 0n) {
       try {
         fee = feeOut(assetOut, (await deps.simulateFill(base, 1n)).minResourceFee);
       } catch (e) {
@@ -296,13 +340,20 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
 
     // Pass 1: the most the solver could pay at all. min_out = 1 and a 100% improvement share make `amountOut` that maximum.
     const best = evaluateFill(base, hedge?.quote ?? null, params(nowMs, balance, fee, 10_000));
-    if (best.action === "skip") return declined(best.reasons, best.maxPayableOut !== undefined && best.maxPayableOut > 0n ? { solverMaxPay: formatAmount(best.maxPayableOut) } : {});
+    if (best.action === "skip") return declined(best.reasons, hedge, best.maxPayableOut !== undefined && best.maxPayableOut > 0n ? { solverMaxPay: formatAmount(best.maxPayableOut) } : {});
     // What the user signs for: that maximum less their slippage tolerance. The solver then pays more than this by policy.
     const minOut = (best.amountOut * BigInt(10_000 - slippageBps)) / 10_000n;
-    if (minOut <= 0n) return declined(["below_min_profit"]);
+    if (minOut <= 0n) return declined(["below_min_profit"], hedge);
     const order: Order = { ...base, minOut };
     const decision: Decision = evaluateFill(order, hedge!.quote, params(nowMs, balance, fee, config.policy.improvementShareBps));
-    if (decision.action === "skip") return declined(decision.reasons);
+    if (decision.action === "skip") return declined(decision.reasons, hedge);
+    return { order, assetIn, assetOut, amountIn, minOut, validFor, decision, hedge: hedge! };
+  }
+
+  async function prepare(b: Record<string, unknown>): Promise<ServiceResult> {
+    const priced = await priceOrder(b, "auth-entry");
+    if ("status" in priced) return priced;
+    const { order, assetIn, assetOut, amountIn, minOut, validFor, decision } = priced;
 
     let sim: FillSimulation;
     try {
@@ -319,7 +370,7 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
     } catch (e) {
       return fail(502, firstLine((e as Error).message));
     }
-    const validUntilLedger = latest + Math.ceil(validFor / LEDGER_SEC);
+    const validUntilLedger = latest + Math.ceil(validFor / LEDGER);
     const entry = withExpiration(sim.userEntry, validUntilLedger);
     const nonce = entry.credentials().address().nonce().toString();
     const orderId = makeOrderId(config.macSecret, { passphrase: pass, settleContract: config.settleContract, solver, order, amountOut: decision.amountOut, nonce, validUntilLedger });
@@ -336,6 +387,31 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
         networkPassphrase: pass,
       },
     });
+  }
+
+  /** What the solver's answer to a fill or a transaction submission means for the API caller. */
+  function fillResult(o: FillOutcome): ServiceResult {
+    const bad = (code: string, message: string, status = 400) => fail(status, message, explain(code, `${message} Nothing was sent.`, code));
+    switch (o.kind) {
+      case "sent":
+        return ok({ hash: o.hash, status: o.status });
+      case "refused":
+        if (o.reasons.includes("deadline_too_close")) return bad("EXPIRED", "There is too little time left on this order. Prepare a new one.", 410);
+        return fail(409, o.code === "CIRCUIT_BREAKER" ? "the solver has paused new orders" : "the solver no longer fills this order at the prepared price", skipExplained(o.reasons), { skipReasons: o.reasons });
+      case "invalid":
+        if (o.code === "EXPIRED") return bad("EXPIRED", "This order has expired. Prepare a new one.", 410);
+        if (o.code === "ORDERS_MAINNET_REFUSED") return fail(503, "settlement orders are testnet-only", explain(o.code, o.message, o.code));
+        if (o.code === "ORDERS_NETWORK_MISMATCH") return fail(503, o.message, explain(o.code, "Settlement orders are misconfigured on this deployment.", o.code));
+        return bad(o.code, o.message);
+      case "sim_failed":
+        return fail(422, firstLine(o.message), explainFill(o.message, config.settleContract));
+      case "rejected":
+        return fail(422, "the network rejected this transaction", explainCodes(o.codes), { hash: o.hash, status: "ERROR" });
+      case "busy":
+        return fail(503, "the network is busy, submit again in a few seconds", undefined, { hash: o.hash, status: "TRY_AGAIN_LATER" });
+      case "error":
+        return fail(502, firstLine(o.message));
+    }
   }
 
   async function submit(b: Record<string, unknown>): Promise<ServiceResult> {
@@ -362,7 +438,7 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
     const amountOut = verifyOrderId(config.macSecret, orderId, { passphrase: pass, settleContract: config.settleContract, solver, order, nonce: creds.nonce().toString(), validUntilLedger });
     if (amountOut === null) return bad("BAD_ORDER_ID", "orderId does not match this order and entry: it was not prepared by this server, or something in it was changed. Prepare a new order.");
 
-    const refused = await ensureNetwork();
+    const refused = (await ensureNetwork()) ?? (await ensureSolver());
     if (refused) return refused;
     let latest: number;
     try {
@@ -375,6 +451,11 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
 
     const problem = reviewEntry(entry, order, config.settleContract) ?? checkSignature(entry, order, pass);
     if (problem) return bad(problem.code, problem.message);
+
+    // The circuit breaker, before any simulation or quote is paid for.
+    const open = await viaSolver(() => solverPort.canFill());
+    if (!open.ok) return open.result;
+    if (!open.value.ok) return fail(409, "the solver has paused new orders", skipExplained(["circuit_breaker"]), { skipReasons: ["circuit_breaker"] });
 
     // Enforcing simulation: the network itself checks the signature, the nonce and the contract's rules.
     let sim: FillSimulation;
@@ -400,53 +481,116 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
       return fail(409, "the solver no longer fills this order at the prepared price", skipExplained(recheck.reasons), { skipReasons: recheck.reasons });
     }
 
-    let sent: SubmitResult;
+    const sent = await viaSolver(() => solverPort.fill({ order, assetIn, assetOut, amountOut, signedUserEntry: signedXdr, quoteOut: hedge?.quote.amountOut }));
+    if (!sent.ok) return sent.result;
+    return fillResult(sent.value);
+  }
+
+  // ------------------------------------------------------------------------------------------------------------
+  // Tier 2: the user signs a transaction
+
+  async function prepareTx(b: Record<string, unknown>): Promise<ServiceResult> {
+    const priced = await priceOrder(b, "tx");
+    if ("status" in priced) return priced;
+    const { order, assetIn, assetOut, amountIn, minOut, validFor, decision, hedge } = priced;
+
+    const out = await viaSolver(() => solverPort.prepareTx({ order, assetIn, assetOut, amountOut: decision.amountOut, validForSec: validFor, quoteOut: hedge.quote.amountOut }));
+    if (!out.ok) return out.result;
+    const r = out.value;
+    if (r.kind !== "prepared") return fillResult(r.kind === "refused" || r.kind === "invalid" || r.kind === "sim_failed" || r.kind === "busy" || r.kind === "error" ? r : { kind: "error", message: "unexpected answer from the solver" });
+
+    // Do not hand a user a transaction this server has not checked itself: the solver is another process.
+    const tx = parseUserTx(r.tx.xdr, pass);
+    const facts = isProblem(tx) ? tx : inspectUserTx(tx, order, txCtx, { nowSec: Math.floor(deps.now() / 1000), requireUserSignature: false });
+    if (isProblem(facts) || isProblem(tx) || facts.amountOut !== decision.amountOut || tx.hash().toString("hex") !== r.tx.hash) {
+      return fail(502, "the solver returned a transaction that is not the order that was priced", explain("SOLVER_TX_MISMATCH", "The solver prepared something other than the order that was priced, so nothing was offered for signing.", isProblem(facts) ? facts.code : "mismatch"));
+    }
+    const orderId = makeOrderId(config.macSecret, {
+      passphrase: pass, settleContract: config.settleContract, solver, order, amountOut: decision.amountOut, nonce: facts.solverNonce, validUntilLedger: facts.solverValidUntilLedger, tier: "tx",
+    });
+    return ok({
+      solverWillFill: true,
+      orderId,
+      order: orderFields(order, assetIn, assetOut),
+      summary: { pay: formatAmount(amountIn), receiveAtLeast: formatAmount(minOut), expected: formatAmount(decision.amountOut), networkFee: formatAmount(BigInt(tx.fee)) },
+      tx: {
+        xdr: r.tx.xdr,
+        hash: r.tx.hash,
+        source: order.user,
+        validUntilLedger: facts.solverValidUntilLedger,
+        maxTime: facts.maxTimeSec,
+        networkPassphrase: pass,
+      },
+    });
+  }
+
+  async function submitTx(b: Record<string, unknown>): Promise<ServiceResult> {
+    const orderId = String(b.orderId ?? "");
+    const signedTx = String(b.signedTx ?? "");
+    const parsed = parseOrderFields(b.order, pass);
+    if (typeof parsed === "string") return fail(400, parsed);
+    if (!orderId) return fail(400, "orderId is required");
+    if (!signedTx) return fail(400, "signedTx is required");
+    const { order, assetIn, assetOut } = parsed;
+    const bad = (code: string, message: string, status = 400) => fail(status, message, explain(code, `${message} Nothing was sent.`, code));
+
+    const tx = parseUserTx(signedTx, pass);
+    if (isProblem(tx)) return bad(tx.code, tx.message);
+    // The order id binds the order, the amount, and the SOLVER's entry (its nonce and expiry): find that entry before anything else.
+    const se = solverEntryOf(tx, txCtx);
+    if (isProblem(se)) return bad(se.code, se.message);
+    const amountOut = verifyOrderId(config.macSecret, orderId, { passphrase: pass, settleContract: config.settleContract, solver, order, nonce: se.nonce, validUntilLedger: se.validUntilLedger, tier: "tx" });
+    if (amountOut === null) return bad("BAD_ORDER_ID", "orderId does not match this order and transaction: it was not prepared by this server, or something in it was changed. Prepare a new one.");
+
+    const refused = (await ensureNetwork()) ?? (await ensureSolver());
+    if (refused) return refused;
+    const nowSec = Math.floor(deps.now() / 1000);
+    const facts = inspectUserTx(tx, order, txCtx, { nowSec, requireUserSignature: true });
+    if (isProblem(facts)) return bad(facts.code, facts.message);
+    if (facts.amountOut !== amountOut) return bad("BAD_ORDER_ID", "The amount in the transaction is not the amount this server agreed to. Prepare a new one.");
+
+    let latest: number;
+    let current: string;
     try {
-      sent = await sim.send();
+      [latest, current] = await Promise.all([deps.latestLedger(), deps.accountSequence(order.user)]);
+    } catch (e) {
+      const m = (e as Error).message;
+      return fail(502, firstLine(m));
+    }
+    if (facts.solverValidUntilLedger <= latest + 2 || facts.maxTimeSec <= nowSec + 10 || order.deadline <= nowSec + 15) return bad("EXPIRED", "This order has expired. Prepare a new one.", 410);
+    if (BigInt(tx.sequence) !== BigInt(current) + 1n) {
+      return bad("BAD_SEQUENCE", "The account's sequence number has moved since this transaction was prepared (another transaction was sent from it). Prepare a new one.", 409);
+    }
+
+    const open = await viaSolver(() => solverPort.canFill());
+    if (!open.ok) return open.result;
+    if (!open.value.ok) return fail(409, "the solver has paused new orders", skipExplained(["circuit_breaker"]), { skipReasons: ["circuit_breaker"] });
+
+    // Simulate the exact envelope the user signed: the network checks both authorisations and the contract's rules.
+    try {
+      await deps.simulateTx(tx);
+    } catch (e) {
+      const raw = (e as Error).message;
+      return fail(422, firstLine(raw), explainFill(raw, config.settleContract));
+    }
+
+    const pair: ClassicPair = { tokenIn: assetIn, tokenOut: assetOut };
+    let hedge: QuotedHedge | null;
+    let balance: bigint;
+    try {
+      [hedge, balance] = await Promise.all([deps.hedgeQuote(order, pair), deps.solverBalance(assetOut)]);
     } catch (e) {
       return fail(502, firstLine((e as Error).message));
     }
-    if (sent.status === "ERROR") {
-      return fail(422, "the network rejected this transaction", explainCodes(sent.codes ?? []), { hash: sent.hash, status: sent.status });
+    const recheck = evaluateFill({ ...order, minOut: amountOut }, hedge?.quote ?? null, params(deps.now(), balance, feeOut(assetOut, 0n, true), 0));
+    if (recheck.action === "skip") {
+      if (recheck.reasons.includes("deadline_too_close")) return bad("EXPIRED", "There is too little time left on this order. Prepare a new one.", 410);
+      return fail(409, "the solver no longer fills this order at the prepared price", skipExplained(recheck.reasons), { skipReasons: recheck.reasons });
     }
-    if (sent.status === "TRY_AGAIN_LATER") return fail(503, "the network is busy, submit again in a few seconds", undefined, { hash: sent.hash, status: sent.status });
-    track(sent.hash, order, pair, amountOut);
-    return ok({ hash: sent.hash, status: sent.status });
-  }
 
-  /** After the fill is sent: wait for it to land, then hedge. Runs in this process only; its state is not durable. */
-  function track(hash: string, order: Order, pair: ClassicPair, amountOut: bigint): void {
-    setHedge(hash, { status: "PENDING" });
-    const run = (async () => {
-      const deadline = Date.now() + fillWaitMs;
-      let tx: OrderTx | undefined;
-      while (Date.now() < deadline) {
-        try {
-          tx = await deps.getTx(hash);
-          if (tx.status !== "NOT_FOUND") break;
-        } catch { /* keep polling */ }
-        await new Promise((r) => setTimeout(r, pollMs));
-      }
-      if (!tx || tx.status !== "SUCCESS") {
-        setHedge(hash, { status: "NOT_NEEDED", reason: tx?.status === "FAILED" ? "the fill failed, so the solver took nothing" : "the fill was not seen in a ledger" });
-        return;
-      }
-      setHedge(hash, { status: "HEDGING" });
-      try {
-        const r = await deps.hedge(order, pair, amountOut);
-        if (r.error) throw new Error(r.error);
-        setHedge(hash, { status: "HEDGED", hash: r.hash!, received: r.received === undefined ? undefined : formatAmount(r.received) });
-      } catch (e) {
-        const error = firstLine((e as Error).message);
-        setHedge(hash, { status: "UNHEDGED", error });
-        // SEAM(recovery): hand the unhedged position to the recovery module here.
-        try {
-          await opts.hooks?.onUnhedged?.({ fillHash: hash, order, amountOut, error });
-        } catch { /* a failing hook must not hide the UNHEDGED status */ }
-      }
-    })();
-    pending.add(run);
-    void run.finally(() => pending.delete(run));
+    const sent = await viaSolver(() => solverPort.submitTx({ signedTx }));
+    if (!sent.ok) return sent.result;
+    return fillResult(sent.value);
   }
 
   async function status(hash: string): Promise<ServiceResult> {
@@ -459,15 +603,23 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
     } catch (e) {
       return fail(502, firstLine((e as Error).message));
     }
-    const hedge = hedges.get(hash);
-    if (t.status === "NOT_FOUND") return ok({ hash, status: "NOT_FOUND", ...(hedge ? { hedge } : {}) });
+    // The hedge is the solver's business and is asked for last: if the solver cannot answer, the user's fill status stands.
+    const hedgeOf = async (): Promise<{ hedge?: HedgeStatus }> => {
+      try {
+        const h = await solverPort.orderStatus(hash);
+        return h ? { hedge: h } : {};
+      } catch (e) {
+        return { hedge: { status: "UNKNOWN", reason: e instanceof SolverUnavailable ? "the solver service could not be asked" : "the hedge status could not be read" } };
+      }
+    };
+    if (t.status === "NOT_FOUND") return ok({ hash, status: "NOT_FOUND", ...(await hedgeOf()) });
     const fill = readFill(t, config.settleContract);
     if (!fill) return fail(404, "that transaction is not a fill of this settlement contract");
     if (t.status === "SUCCESS") {
-      return ok({ hash, status: "SUCCESS", ledger: t.ledger, createdAt: t.createdAt, received: fill.received === undefined ? undefined : formatAmount(fill.received), ...(hedge ? { hedge } : {}) });
+      return ok({ hash, status: "SUCCESS", ledger: t.ledger, createdAt: t.createdAt, received: fill.received === undefined ? undefined : formatAmount(fill.received), ...(await hedgeOf()) });
     }
     const explained = (t.contractError !== undefined ? explainSettleCode(t.contractError) : null) ?? explainCodes(t.codes ?? []);
-    return ok({ hash, status: "FAILED", ledger: t.ledger, createdAt: t.createdAt, explained, ...(hedge ? { hedge } : {}) });
+    return ok({ hash, status: "FAILED", ledger: t.ledger, createdAt: t.createdAt, explained, ...(await hedgeOf()) });
   }
 
   return {
@@ -475,12 +627,9 @@ export function createOrdersService(config: OrdersConfig, deps: OrdersDeps, opts
     publicConfig,
     prepare,
     submit,
+    prepareTx,
+    submitTx,
     status,
-    /** Test hook: resolves when every post-fill tracker has finished. */
-    async idle() {
-      while (pending.size) await Promise.all([...pending]);
-    },
-    hedgeOf: (hash: string) => hedges.get(hash),
   };
 }
 

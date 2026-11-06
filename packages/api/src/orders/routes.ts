@@ -1,24 +1,68 @@
 import type { Context, Hono } from "hono";
-import { createOrdersService, type OrdersHooks, type OrdersService } from "./service.js";
+import { createSolverNode, FileStore, MemoryStore, RemoteSolver, type SolverNode, type SolverPort } from "@sluice/solver";
+import { createOrdersService, type OrdersService } from "./service.js";
 import { defaultOrdersDeps } from "./deps.js";
-import { loadOrdersConfig, type OrdersSetup } from "./config.js";
+import { loadOrdersConfig, type OrdersConfig, type OrdersSetup } from "./config.js";
 
-/** What `createApp` is given: a running service, or the reason there is none. */
+/**
+ * What `createApp` is given: a running service, or the reason there is none. `background` exists only when the solver runs in
+ * this process (local mode): `start()` restores its stored state and begins the recovery loop, `stop()` ends it.
+ */
 export type OrdersWiring =
-  | { enabled: true; service: OrdersService }
+  | { enabled: true; service: OrdersService; background?: { start(): Promise<void>; stop(): Promise<void> } }
   | { enabled: false; code: string; reason: string };
 
 export const ORDERS_DISABLED: OrdersWiring = { enabled: false, code: "ORDERS_NOT_CONFIGURED", reason: "settlement orders are not configured on this deployment" };
 
-/** Build the wiring from environment variables. Never throws: anything wrong becomes a disabled feature with its reason. */
-export function ordersFromEnv(env: Record<string, string | undefined>, hooks?: OrdersHooks): OrdersWiring {
-  return wire(loadOrdersConfig(env), hooks);
+export interface WireOptions {
+  /** Use this solver instead of building one from the configuration (tests). */
+  solver?: SolverPort;
+  log?: (msg: string, detail?: unknown) => void;
 }
 
-export function wire(setup: OrdersSetup, hooks?: OrdersHooks): OrdersWiring {
+/** Build the wiring from environment variables. Never throws: anything wrong becomes a disabled feature with its reason. */
+export function ordersFromEnv(env: Record<string, string | undefined>, o: WireOptions = {}): OrdersWiring {
+  return wire(loadOrdersConfig(env), o);
+}
+
+/** The in-process solver (local mode): the same `SolverNode` the standalone service runs, with its key in this process. */
+export function localSolver(config: OrdersConfig, o: WireOptions = {}): SolverNode {
+  if (config.solver.mode !== "local") throw new Error("not a local solver configuration");
+  const log = o.log ?? ((m: string, d?: unknown) => console.warn(`[solver] ${m}${d === undefined ? "" : ` ${typeof d === "string" ? d : JSON.stringify(d)}`}`));
+  if (!config.stateDir) log("SLUICE_STATE_DIR is not set: the in-process solver forgets open positions on restart");
+  const store = config.stateDir ? new FileStore(config.stateDir) : new MemoryStore();
+  return createSolverNode(
+    {
+      passphrase: config.networkPassphrase, settleContract: config.settleContract, rpcUrl: config.rpcUrl, horizonUrl: config.horizonUrl, secret: config.solver.secret,
+      policy: { ...config.policy, feeOutPerXlm: config.feeOutPerXlm }, recovery: config.recovery, retry: config.retry,
+    },
+    store,
+    { log },
+  );
+}
+
+export function wire(setup: OrdersSetup, o: WireOptions = {}): OrdersWiring {
   if (!setup.enabled) return { enabled: false, code: setup.code, reason: setup.reason };
   try {
-    return { enabled: true, service: createOrdersService(setup.config, defaultOrdersDeps(setup.config), { hooks }) };
+    const { config } = setup;
+    let port: SolverPort;
+    let background: { start(): Promise<void>; stop(): Promise<void> } | undefined;
+    if (o.solver) {
+      port = o.solver;
+    } else if (config.solver.mode === "remote") {
+      port = new RemoteSolver({ url: config.solver.url, token: config.solver.token, address: config.solverAddress });
+    } else {
+      const node = localSolver(config, o);
+      port = node;
+      background = {
+        start: async () => {
+          await node.restore();
+          node.start();
+        },
+        stop: () => node.close(),
+      };
+    }
+    return { enabled: true, service: createOrdersService(config, defaultOrdersDeps(config), port), ...(background ? { background } : {}) };
   } catch (e) {
     return { enabled: false, code: "ORDERS_INVALID", reason: (e as Error).message };
   }
@@ -76,6 +120,22 @@ export function registerOrderRoutes(app: Hono, orders: OrdersWiring): void {
     const b = await jsonBody(c);
     if (!b) return c.json({ error: "body must be JSON" }, 400);
     const r = await orders.service.submit(b);
+    return c.json(r.body, r.status as 200);
+  });
+
+  app.post("/v1/orders/prepare-tx", async (c) => {
+    if (!orders.enabled) return disabled(c);
+    const b = await jsonBody(c);
+    if (!b) return c.json({ error: "body must be JSON" }, 400);
+    const r = await orders.service.prepareTx(b);
+    return c.json(r.body, r.status as 200);
+  });
+
+  app.post("/v1/orders/submit-tx", async (c) => {
+    if (!orders.enabled) return disabled(c);
+    const b = await jsonBody(c);
+    if (!b) return c.json({ error: "body must be JSON" }, 400);
+    const r = await orders.service.submitTx(b);
     return c.json(r.body, r.status as 200);
   });
 
