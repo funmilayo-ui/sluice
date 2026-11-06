@@ -193,6 +193,17 @@ export class ExposureLedger {
   private seq = 0;
   constructor(private onChange?: (all: Exposure[]) => void) {}
 
+  /**
+   * Load exposures that were persisted by an earlier process. Does not fire `onChange` (nothing changed). The sequence
+   * counter continues after the highest restored one so later exposures still sort after them.
+   */
+  restore(all: Exposure[]): void {
+    for (const e of all) {
+      this.entries.set(e.id, e);
+      if (e.seq > this.seq) this.seq = e.seq;
+    }
+  }
+
   add(e: Omit<Exposure, "seq">): Exposure {
     const full = { ...e, seq: ++this.seq };
     this.entries.set(full.id, full);

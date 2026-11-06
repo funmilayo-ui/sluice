@@ -82,3 +82,43 @@ describe("result decoding is defensive", () => {
     expect(proceedsFromResult(undefined)).toBeNull();
   });
 });
+
+describe("createStellarHedgeIo with a shared sequencer and a pre-send record", () => {
+  it("records the transaction's hash BEFORE sending it, so a restart can find out what became of it", async () => {
+    const order: string[] = [];
+    const { s } = server({ send: async () => { order.push("send"); return { status: "PENDING" }; }, get: async () => ({ status: "SUCCESS" }) });
+    const io = mk(s, { beforeSend: (hash: string, expiresAtMs: number) => void order.push(`record ${hash.length} ${expiresAtMs > Date.now()}`) });
+    await io.submit(leg, 1n);
+    expect(order).toEqual(["record 64 true", "send"]);
+  });
+  it("sends nothing when the record cannot be made", async () => {
+    const { s, calls } = server({});
+    const r = await mk(s, { beforeSend: () => { throw new Error("disk full"); } }).submit(leg, 1n);
+    expect(r).toMatchObject({ status: "rejected" });
+    expect((r as { error: string }).error).toMatch(/could not record/);
+    expect(calls.send).toBe(0);
+  });
+  it("builds on the sequencer's number, not a fresh read, so a fill and a hedge from one key never collide", async () => {
+    const { Sequencer } = await import("../src/index.js");
+    const { Transaction } = await import("@stellar/stellar-sdk");
+    const sent: string[] = [];
+    const { s } = server({ send: async () => ({ status: "PENDING" }), get: async () => ({ status: "SUCCESS" }) });
+    (s as unknown as { sendTransaction: (tx: InstanceType<typeof Transaction>) => Promise<unknown> }).sendTransaction = async (tx) => { sent.push(tx.sequence); return { status: "PENDING" }; };
+    const sequencer = new Sequencer(async () => 100n);
+    await sequencer.run(async (base) => ({ value: base, accepted: true })); // a fill took 101
+    await mk(s, { sequencer }).submit(leg, 1n);
+    expect(sent).toEqual(["102"]);
+  });
+  it("a txBadSeq answer makes the sequencer forget its count", async () => {
+    const { Sequencer } = await import("../src/index.js");
+    const { xdr } = await import("@stellar/stellar-sdk");
+    const sequencer = new Sequencer(async () => 100n);
+    const result = new xdr.TransactionResult({ feeCharged: xdr.Int64.fromString("100"), result: xdr.TransactionResultResult.txBadSeq(), ext: new xdr.TransactionResultExt(0) });
+    const { s } = server({ send: async () => ({ status: "ERROR", errorResult: result }) });
+    await sequencer.run(async (b) => ({ value: b, accepted: true }));
+    expect(await mk(s, { sequencer }).submit(leg, 1n)).toMatchObject({ status: "rejected" });
+    const seen: bigint[] = [];
+    await sequencer.run(async (b) => ({ value: seen.push(b), accepted: true }));
+    expect(seen).toEqual([100n]);
+  });
+});

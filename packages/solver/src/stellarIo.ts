@@ -1,7 +1,8 @@
 import { Keypair, rpc, Transaction, xdr } from "@stellar/stellar-sdk";
-import type { Leg } from "@sluice/core";
+import { resultCodes, type Leg } from "@sluice/core";
 import type { HedgeIo, SubmitResult, TxStatus } from "./executor.js";
 import { buildHedgeTx, type QuotedHedge } from "./hedge.js";
+import type { Sequencer } from "./sequencer.js";
 
 /**
  * The real `HedgeIo`: signs and sends the Classic hedge through Soroban RPC and reports exactly one of the three
@@ -22,6 +23,14 @@ export interface StellarHedgeIoOpts {
   pollMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** Share the solver account's sequence numbers with the fills signed by the same key. Without it each send reads the account. */
+  sequencer?: Sequencer;
+  /**
+   * Called with the transaction's hash after it is signed and BEFORE it is sent, so a caller can record "this hash may
+   * be in flight" durably. If the process dies after that, the hash is what lets the next process find out what happened.
+   * A throw here aborts the send (reported as `rejected`: nothing left the machine).
+   */
+  beforeSend?: (hash: string, expiresAtMs: number) => Promise<void> | void;
 }
 
 /** Name of the first operation's failure inside a failed transaction result, e.g. `pathPaymentStrictSendUnderDestmin`. */
@@ -82,25 +91,47 @@ export function createStellarHedgeIo(o: StellarHedgeIoOpts): HedgeIo {
       return "not_found";
     },
     async submit(leg: Leg, minOut: bigint): Promise<SubmitResult> {
-      let tx: Transaction;
+      type Phase = { early: SubmitResult } | { hash: string; expiresAtMs: number };
+      const attempt = async (sequence: string): Promise<{ value: Phase; accepted: boolean; badSeq?: boolean }> => {
+        let tx: Transaction;
+        try {
+          tx = new Transaction(buildHedgeTx(leg, { source: o.solver.publicKey(), sequence, minOut, passphrase: o.passphrase, timeoutSec }), o.passphrase);
+          tx.sign(o.solver);
+        } catch (e) {
+          return { value: { early: { status: "rejected", error: `not sent: ${(e as Error).message}` } }, accepted: false }; // nothing left the machine
+        }
+        const hash = tx.hash().toString("hex");
+        const expiresAtMs = Number(tx.timeBounds?.maxTime ?? 0) * 1000 || now() + timeoutSec * 1000;
+        try {
+          await o.beforeSend?.(hash, expiresAtMs);
+        } catch (e) {
+          return { value: { early: { status: "rejected", error: `not sent: could not record the submission (${(e as Error).message})` } }, accepted: false };
+        }
+        let sent: rpc.Api.SendTransactionResponse;
+        try {
+          sent = await o.server.sendTransaction(tx);
+        } catch (e) {
+          // The node may have received it, so the sequence number may be used: treat it as accepted (a later txBadSeq resets it).
+          return { value: { early: { status: "unknown", hash, error: `send threw, the node may have received it: ${(e as Error).message}`, expiresAtMs } }, accepted: true };
+        }
+        let badSeq = false;
+        try {
+          badSeq = !!sent.errorResult && resultCodes(sent.errorResult).includes("txBadSeq");
+        } catch { /* an unreadable result is not a sequence verdict */ }
+        if (sent.status === "ERROR") return { value: { early: { status: "rejected", error: `network refused it: ${describeFailure(sent.errorResult)}` } }, accepted: false, badSeq };
+        if (sent.status === "TRY_AGAIN_LATER") return { value: { early: { status: "rejected", error: "node asked to try again later; not accepted" } }, accepted: false };
+        return { value: { hash, expiresAtMs }, accepted: true };
+      };
+      let phase: Phase;
       try {
-        const acc = await read(() => o.server.getAccount(o.solver.publicKey()));
-        tx = new Transaction(buildHedgeTx(leg, { source: o.solver.publicKey(), sequence: acc.sequenceNumber(), minOut, passphrase: o.passphrase, timeoutSec }), o.passphrase);
-        tx.sign(o.solver);
+        phase = o.sequencer
+          ? await o.sequencer.run((base) => attempt(base.toString()))
+          : (await attempt((await read(() => o.server.getAccount(o.solver.publicKey()))).sequenceNumber())).value;
       } catch (e) {
-        return { status: "rejected", error: `not sent: ${(e as Error).message}` }; // nothing left the machine
+        return { status: "rejected", error: `not sent: ${(e as Error).message}` };
       }
-      const hash = tx.hash().toString("hex");
-      const expiresAtMs = Number(tx.timeBounds?.maxTime ?? 0) * 1000 || now() + timeoutSec * 1000;
-
-      let sent: rpc.Api.SendTransactionResponse;
-      try {
-        sent = await o.server.sendTransaction(tx);
-      } catch (e) {
-        return { status: "unknown", hash, error: `send threw, the node may have received it: ${(e as Error).message}`, expiresAtMs };
-      }
-      if (sent.status === "ERROR") return { status: "rejected", error: `network refused it: ${describeFailure(sent.errorResult)}` };
-      if (sent.status === "TRY_AGAIN_LATER") return { status: "rejected", error: "node asked to try again later; not accepted" };
+      if ("early" in phase) return phase.early;
+      const { hash, expiresAtMs } = phase;
       // PENDING or DUPLICATE: it is (or was) in the queue. Wait for the ledger.
       const giveUp = now() + confirmMs;
       while (now() < giveUp) {

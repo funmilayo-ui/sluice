@@ -22,7 +22,10 @@
     "w1:settle-testnet": "tsx scripts/w1-settle-testnet.ts",
     "w2:solver-testnet": "tsx scripts/w2-solver-testnet.ts",
     "w4:orders-api-testnet": "tsx scripts/w4-orders-api-testnet.ts",
-    "w3:hedge-failure-testnet": "tsx scripts/w3-hedge-failure-testnet.ts"
+    "w3:hedge-failure-testnet": "tsx scripts/w3-hedge-failure-testnet.ts",
+    "w5:recovery-restart-testnet": "tsx scripts/w5-recovery-restart-testnet.ts",
+    "w6:tx-tier-testnet": "tsx scripts/w6-tx-tier-testnet.ts",
+    "solver": "pnpm --filter @sluice/solver start"
   },
   "devDependencies": {
     "tsx": "^4.19.0",
