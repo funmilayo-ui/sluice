@@ -222,8 +222,8 @@ Fill one row per case per wallet. Pass means exactly as expected above. Do not f
 | C2 review | | summary + trustline note | | | |
 | C3 sign and fill | Varial (kit 2.8.0, extension version not recorded), testnet, native XLM in, harness `HARNESS_INPUT=native` | "Confirm Authorizations"; fill lands; exact balances | Fill landed: paid exactly 10 XLM (17508.5053775 to 17498.5053775), received 9.6143165 SLFC; transaction sourced from the solver, no fee to the user; solver hedge HEDGED. Popup wording not recorded. | Pass (fill and balances); popup wording not checked | fill `8223248776f7b536980713ff63d0546f7907ef851269965fd9ae80c6fc45ee4f` (ledger 5595587), hedge `13d0cc4774fbcafb6c05b064102606e5e457af3d8ac629cf2174d038bb382a5b` |
 | C4 signature verifies | | no local verification error | | | |
-| C5 no-trustline order | | fills; no trustline note | | | |
-| C6 decline | | "You declined the request in your wallet" | | | |
+| C5 no-trustline order | Varial (kit 2.8.0), testnet, native XLM in | fills; no trustline note | Second order filled: paid exactly 10 XLM, received 9.6154130 SLFC (the expected amount shown); sourced from the solver, no user fee; hedge HEDGED. Auth tree decoded: `fill` then `transfer`, no `trust`. | Pass | fill `4674e0a3d07d2419e6ec237ebc6361a5f4c6afbe59bf3484a8928e61a1c66c76` (ledger 5595729), hedge `5662ac75beda55fd20d00dc1c7b89b968b325f1a4d0bbae6a321f6ecf717b1bc` |
+| C6 decline | Varial (kit 2.8.0) | "You declined the request in your wallet" | Tester believes they declined once; the app text and wallet error code were not captured. Nothing reaches the chain on a decline, so there is no on-chain evidence either way. | Unverified | none |
 | C7 close popup | | "Stop waiting" works | | | |
 | C8 expiry | | "This order expired"; nothing sent | | | |
 | C9 too large | | declined with reasons; no popup | | | |
