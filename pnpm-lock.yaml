@@ -79,6 +79,12 @@ importers:
       '@sluice/core':
         specifier: workspace:*
         version: link:../core
+      '@sluice/solver':
+        specifier: workspace:*
+        version: link:../solver
+      '@stellar/stellar-sdk':
+        specifier: ^14.0.0
+        version: 14.6.1
       hono:
         specifier: ^4.6.0
         version: 4.13.13
@@ -89,7 +95,20 @@ importers:
         specifier: ^14.0.0
         version: 14.6.1
 
-  packages/sdk: {}
+  packages/sdk:
+    dependencies:
+      '@stellar/stellar-sdk':
+        specifier: ^14.0.0
+        version: 14.6.1
+
+  packages/solver:
+    dependencies:
+      '@sluice/core':
+        specifier: workspace:*
+        version: link:../core
+      '@stellar/stellar-sdk':
+        specifier: ^14.0.0
+        version: 14.6.1
 
 packages:
 

@@ -18,7 +18,11 @@
     "dev": "pnpm --filter @sluice/api dev",
     "dev:web": "pnpm --filter @sluice/web dev",
     "e2e": "pnpm --filter @sluice/web e2e",
-    "w0:testnet-flow": "tsx scripts/w0-testnet-flow.ts"
+    "w0:testnet-flow": "tsx scripts/w0-testnet-flow.ts",
+    "w1:settle-testnet": "tsx scripts/w1-settle-testnet.ts",
+    "w2:solver-testnet": "tsx scripts/w2-solver-testnet.ts",
+    "w4:orders-api-testnet": "tsx scripts/w4-orders-api-testnet.ts",
+    "w3:hedge-failure-testnet": "tsx scripts/w3-hedge-failure-testnet.ts"
   },
   "devDependencies": {
     "tsx": "^4.19.0",
