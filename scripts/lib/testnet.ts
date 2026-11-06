@@ -112,12 +112,21 @@ export interface Market {
 }
 
 /** Throwaway parties, assets A and C, SAC contracts, a freshly deployed settle contract. The maker has C to sell for A; the user holds A and has NO C trustline. */
-export async function setupMarket(): Promise<Market> {
-  const issuer = Keypair.random(), user = Keypair.random(), solver = Keypair.random(), maker = Keypair.random(), stranger = Keypair.random();
-  for (const kp of [issuer, user, solver, maker, stranger]) await friendbot(kp);
+export interface MarketOptions {
+  /** Use these parties instead of throwaway keys (already funded when `funded` is set, e.g. created with `stellar keys generate --fund`). */
+  keys?: Partial<Pick<Market, "issuer" | "user" | "solver" | "maker" | "stranger">>;
+  funded?: boolean;
+  /** Asset codes for A and C. Default SLFA / SLFC; a re-run with the same issuer needs fresh codes (a SAC can only be created once). */
+  codes?: [string, string];
+}
+export async function setupMarket(opts: MarketOptions = {}): Promise<Market> {
+  const k = opts.keys ?? {};
+  const issuer = k.issuer ?? Keypair.random(), user = k.user ?? Keypair.random(), solver = k.solver ?? Keypair.random(), maker = k.maker ?? Keypair.random(), stranger = k.stranger ?? Keypair.random();
+  if (!opts.funded) for (const kp of [issuer, user, solver, maker, stranger]) await friendbot(kp);
   console.log(`issuer ${issuer.publicKey()}\nuser   ${user.publicKey()}\nsolver ${solver.publicKey()}\nmaker  ${maker.publicKey()}`);
-  const A = new Asset("SLFA", issuer.publicKey());
-  const C = new Asset("SLFC", issuer.publicKey());
+  const [codeA, codeC] = opts.codes ?? ["SLFA", "SLFC"];
+  const A = new Asset(codeA, issuer.publicKey());
+  const C = new Asset(codeC, issuer.publicKey());
   await run(user, [Operation.changeTrust({ asset: A })]);
   await run(solver, [Operation.changeTrust({ asset: A }), Operation.changeTrust({ asset: C })]);
   await run(maker, [Operation.changeTrust({ asset: A }), Operation.changeTrust({ asset: C })]);
@@ -133,7 +142,7 @@ export async function setupMarket(): Promise<Market> {
   const deployed = await run(solver, [Operation.createCustomContract({ address: new Address(solver.publicKey()), wasmHash, salt: Keypair.random().rawPublicKey() })], true);
   const settleId = Address.fromScVal(deployed.done.returnValue!).toString();
   console.log(`settle ${settleId}  (${wasm.length} bytes)`);
-  return { issuer, user, solver, maker, stranger, A, C, idA: `SLFA:${issuer.publicKey()}`, idC: `SLFC:${issuer.publicKey()}`, settleId };
+  return { issuer, user, solver, maker, stranger, A, C, idA: `${codeA}:${issuer.publicKey()}`, idC: `${codeC}:${issuer.publicKey()}`, settleId };
 }
 
 /** The maker's resting offers that SELL C for A. `setBook` cancels what is left of the previous ones and posts `tiers` (none = the book disappears). */

@@ -25,6 +25,7 @@
     "w3:hedge-failure-testnet": "tsx scripts/w3-hedge-failure-testnet.ts",
     "w5:recovery-restart-testnet": "tsx scripts/w5-recovery-restart-testnet.ts",
     "w6:tx-tier-testnet": "tsx scripts/w6-tx-tier-testnet.ts",
+    "w7:cli-wallets-testnet": "tsx scripts/w7-cli-wallets-testnet.ts",
     "solver": "pnpm --filter @sluice/solver start"
   },
   "devDependencies": {
