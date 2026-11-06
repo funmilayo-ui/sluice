@@ -113,20 +113,27 @@ const user = external ? undefined : Keypair.random();
 const userAddress = external ?? user!.publicKey();
 const solver = Keypair.random();
 const maker = Keypair.random();
+// A request whose reply was lost may still have funded the account; the retry then gets a 400 ("already funded"). Treat an account
+// that exists on Horizon as funded.
 const friendbot = (addr: string) => retry("friendbot", async () => {
+  const exists = await timedFetch(`${HORIZON}/accounts/${addr}`).then((r) => r.status === 200, () => false);
+  if (exists) return;
   const r = await timedFetch(`https://friendbot.stellar.org?addr=${addr}`);
   if (!r.ok) throw new Error(`friendbot ${r.status}`);
-});
+}, 20);
 for (const kp of [issuer, solver, maker]) await friendbot(kp.publicKey());
 if (user) await friendbot(user.publicKey());
 else await friendbot(userAddress).catch(() => console.log("friendbot did not fund your address (it may already be funded); continuing"));
-const A = new Asset("SLFA", issuer.publicKey());
+// HARNESS_INPUT=native: the user pays testnet XLM, which every funded account already holds, so a real-wallet tester has nothing to add
+// or search for. Only the output asset SLFC is ours, and its trustline is created inside the fill (the feature under test).
+const NATIVE_IN = process.env.HARNESS_INPUT === "native";
+const A = NATIVE_IN ? Asset.native() : new Asset("SLFA", issuer.publicKey());
 const C = new Asset("SLFC", issuer.publicKey());
-if (user) await run(user, [Operation.changeTrust({ asset: A })], false); // the user trusts SLFA only: no SLFC trustline
-await run(solver, [Operation.changeTrust({ asset: A }), Operation.changeTrust({ asset: C })], false);
-await run(maker, [Operation.changeTrust({ asset: A }), Operation.changeTrust({ asset: C })], false);
+if (user && !NATIVE_IN) await run(user, [Operation.changeTrust({ asset: A })], false); // the user trusts SLFA only: no SLFC trustline
+await run(solver, [...(NATIVE_IN ? [] : [Operation.changeTrust({ asset: A })]), Operation.changeTrust({ asset: C })], false);
+await run(maker, [...(NATIVE_IN ? [] : [Operation.changeTrust({ asset: A })]), Operation.changeTrust({ asset: C })], false);
 await run(issuer, [
-  ...(user ? [Operation.payment({ destination: user.publicKey(), asset: A, amount: "1000" })] : []),
+  ...(user && !NATIVE_IN ? [Operation.payment({ destination: user.publicKey(), asset: A, amount: "1000" })] : []),
   Operation.payment({ destination: solver.publicKey(), asset: C, amount: "1000" }),
   Operation.payment({ destination: maker.publicKey(), asset: C, amount: "1000" }),
 ], false);
@@ -134,7 +141,7 @@ await run(maker, [
   Operation.manageSellOffer({ selling: C, buying: A, amount: "60", price: "1.03" }),
   Operation.manageSellOffer({ selling: C, buying: A, amount: "200", price: "1.05" }),
 ], false);
-for (const asset of [A, C]) await run(solver, [Operation.createStellarAssetContract({ asset })], true);
+for (const asset of NATIVE_IN ? [C] : [A, C]) await run(solver, [Operation.createStellarAssetContract({ asset })], true);
 const wasm = readFileSync(WASM);
 const wasmHash = createHash("sha256").update(wasm).digest();
 await run(solver, [Operation.uploadContractWasm({ wasm })], true);
@@ -159,7 +166,7 @@ const service = createOrdersService(setup.config, defaultOrdersDeps(setup.config
 const app = createApp(new Router({ sources: [], hubs: [] }), {}, { orders: { enabled: true, service }, webDir: WEB_DIR });
 
 // Real-wallet mode: the tester adds the SLFA trustline in their own wallet; then they are paid.
-if (external) {
+if (external && !NATIVE_IN) {
   console.log(`\nWAITING: in your wallet (on TESTNET) add the asset  SLFA  with issuer  ${issuer.publicKey()}\nThen this will pay you 1000 SLFA. (Freighter: Manage assets > Add an asset manually.)`);
   const holds = async () => {
     const r = await timedFetch(`${HORIZON}/accounts/${external}`);
@@ -169,7 +176,7 @@ if (external) {
   };
   for (let i = 0; ; i++) {
     if (await holds().catch(() => false)) break;
-    if (i > 180) throw new Error("gave up waiting for the SLFA trustline (15 minutes)");
+    if (i > 1000) throw new Error("gave up waiting for the SLFA trustline (about 1 hour)");
     await sleep(5000);
   }
   await run(issuer, [Operation.payment({ destination: external, asset: A, amount: "1000" })], false);
@@ -210,7 +217,7 @@ const fixture = {
   mode: external ? "real wallet" : "test wallet shim",
   solver: solver.publicKey(),
   settle: settleId,
-  assetIn: `SLFA:${issuer.publicKey()}`,
+  assetIn: NATIVE_IN ? "native" : `SLFA:${issuer.publicKey()}`,
   assetOut: `SLFC:${issuer.publicKey()}`,
   book: "sells 60 SLFC at 1.03 SLFA and 200 SLFC at 1.05 SLFA (about 271.8 SLFA deep)",
 };
