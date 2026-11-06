@@ -8,7 +8,7 @@ import { useWallet } from "../lib/wallet";
 import type { Flow } from "./FlowPanel";
 import { PrimaryButton, QuietButton } from "./ui";
 
-export type Tab = "swap" | "earn";
+export type Tab = "swap" | "earn" | "settle";
 
 function Mark() {
   return (
@@ -67,10 +67,11 @@ function WalletButton({ account }: { account: AccountState }) {
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className="inline-flex items-center gap-2 rounded-full bg-shell py-2 pr-4 pl-3 text-sm font-medium ring-1 ring-line transition-transform duration-500 ease-spring active:scale-[0.97]"
+        className="inline-flex items-center gap-2 rounded-full bg-shell py-2 pr-3 pl-3 text-sm font-medium whitespace-nowrap ring-1 ring-line transition-transform duration-500 ease-spring active:scale-[0.97] sm:pr-4"
       >
-        <span className="size-2 rounded-full bg-accent" aria-hidden />
-        <span className="num">{shortKey(address)}</span>
+        <span className="hidden size-2 rounded-full bg-accent sm:block" aria-hidden />
+        <span className="num sm:hidden">{shortKey(address, 3)}</span>
+        <span className="num hidden sm:inline">{shortKey(address)}</span>
         {xlm && <span className="hidden text-muted md:inline"><span className="num">{fmt(xlm, 2)}</span> XLM</span>}
       </button>
       <div
@@ -97,26 +98,28 @@ function WalletButton({ account }: { account: AccountState }) {
 }
 
 /** Floating island: detached from the viewport edge, glass over the page (fixed, so the blur is cheap). */
-export function Nav({ tab, account }: { tab: Tab; account: AccountState }) {
+export function Nav({ tab, account, settle }: { tab: Tab; account: AccountState; /** Settlement orders are on for this deployment: show their tab. */ settle: boolean }) {
   const link = (t: Tab, label: string) => (
     <a
-      href={t === "swap" ? "#/" : "#/earn"}
+      href={t === "swap" ? "#/" : t === "earn" ? "#/earn" : "#/settle"}
       aria-current={tab === t ? "page" : undefined}
-      className={cx("rounded-full px-4 py-2 text-sm font-medium transition-colors duration-500 ease-spring", tab === t ? "bg-surface text-ink shadow-float ring-1 ring-line" : "text-muted hover:text-ink")}
+      className={cx("rounded-full px-2.5 py-2 text-sm font-medium whitespace-nowrap transition-colors duration-500 ease-spring sm:px-4", tab === t ? "bg-surface text-ink shadow-float ring-1 ring-line" : "text-muted hover:text-ink")}
     >
       {label}
+      {t === "settle" && <><span aria-hidden className="ml-1.5 inline-block size-1.5 rounded-full bg-warn align-middle" /><span className="sr-only"> (testnet prototype)</span></>}
     </a>
   );
   return (
     <header className="pointer-events-none fixed inset-x-0 top-0 z-30 flex justify-center px-3 pt-4 sm:pt-6">
       <nav aria-label="Main" className="pointer-events-auto flex w-full max-w-3xl items-center justify-between gap-2 rounded-full bg-(--overlay) p-1.5 ring-1 ring-line backdrop-blur-xl">
-        <a href="#/" className="flex items-center gap-2.5 rounded-full py-1 pr-3 pl-1.5" aria-label="Sluice, go to swap">
+        <a href="#/" className="flex items-center gap-2.5 rounded-full py-1 pr-1 pl-1.5 sm:pr-3" aria-label="Sluice, go to swap">
           <Mark />
           <span className="hidden text-[15px] font-semibold tracking-tight sm:inline">Sluice</span>
         </a>
         <div className="flex items-center gap-1 rounded-full bg-shell p-1">
           {link("swap", "Swap")}
           {link("earn", "Earn")}
+          {settle && link("settle", "Settle")}
         </div>
         <WalletButton account={account} />
       </nav>

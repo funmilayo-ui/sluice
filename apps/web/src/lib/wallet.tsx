@@ -1,4 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import type { SignAuthEntry } from "@sluice/sdk";
+import type { TestWallet } from "./testWallet";
 
 const PUBLIC = "Public Global Stellar Network ; September 2015";
 type Kit = typeof import("@creit.tech/stellar-wallets-kit/sdk").StellarWalletsKit;
@@ -8,6 +10,12 @@ type Kit = typeof import("@creit.tech/stellar-wallets-kit/sdk").StellarWalletsKi
  * the app. Set VITE_WALLETCONNECT_PROJECT_ID at build time to offer it; without it the option is not shown.
  */
 const WALLETCONNECT_PROJECT_ID = (import.meta.env?.VITE_WALLETCONNECT_PROJECT_ID as string | undefined) || undefined;
+/**
+ * Settlement orders (testnet prototype) are signed on the testnet chain, which a WalletConnect session must have
+ * been approved for up front. Off by default so mainnet pairing is exactly what it was; set
+ * VITE_WALLETCONNECT_TESTNET=1 at build time, together with the project id, to test orders over WalletConnect.
+ */
+const WALLETCONNECT_TESTNET = import.meta.env?.VITE_WALLETCONNECT_TESTNET === "1";
 
 let kitPromise: Promise<Kit> | undefined;
 
@@ -42,7 +50,7 @@ function loadKit(): Promise<Kit> {
           url: window.location.origin,
           icons: [`${window.location.origin}/favicon.svg`],
         },
-        allowedChains: [wc.WalletConnectTargetChain.PUBLIC],
+        allowedChains: WALLETCONNECT_TESTNET ? [wc.WalletConnectTargetChain.PUBLIC, wc.WalletConnectTargetChain.TESTNET] : [wc.WalletConnectTargetChain.PUBLIC],
       }));
     }
     const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -82,6 +90,15 @@ export function assertSigner(connected: string | undefined, signer: string | und
   }
 }
 
+/** The kit's id for the wallet it is using, or undefined when none is selected (the kit throws then). */
+function selectedModuleId(kit: Kit): string | undefined {
+  try {
+    return kit.selectedModule.productId;
+  } catch {
+    return undefined;
+  }
+}
+
 /** A wallet error in words. Wallets report rejection differently; the message is theirs, the framing ours. */
 export class WalletError extends Error {}
 function walletMessage(e: unknown): string {
@@ -98,6 +115,16 @@ interface WalletState {
   disconnect(): Promise<void>;
   /** Ask the wallet to sign. Rejects with WalletError when the user declines or the wallet fails. */
   sign(xdr: string): Promise<string>;
+  /** The kit's id for the connected wallet module ("freighter", "albedo", ...), when one is connected. */
+  moduleId: string | undefined;
+  /**
+   * Ask the wallet to sign a Soroban authorisation entry (SEP-43 `signAuthEntry`), for settlement orders.
+   * Rejects with the wallet's own error object untouched ({ code, message }): `classifyWalletFailure` tells
+   * "this wallet cannot do it" (-3) from "the user said no" (-4).
+   */
+  signAuthEntry: SignAuthEntry;
+  /** True only in a test build running the test wallet. Always false in production builds. */
+  testWallet: boolean;
 }
 
 const Ctx = createContext<WalletState | null>(null);
@@ -106,9 +133,25 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [address, setAddress] = useState<string>();
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string>();
+  const [moduleId, setModuleId] = useState<string>();
+  const [shim, setShim] = useState<TestWallet>();
+
+  // TEST-ONLY. `__SLUICE_TEST_WALLET__` is a build-time constant that is false unless the build was made with
+  // SLUICE_TEST_WALLET=1, so in a production build this block and the module it imports are removed entirely.
+  // (Keep the constant in the `if` itself: bundlers fold it there, but not through a helper function.)
+  useEffect(() => {
+    if (__SLUICE_TEST_WALLET__ && /[?&]testwallet=/.test(window.location.search)) {
+      void import("./testWallet").then(({ testWalletFromLocation }) => {
+        const t = testWalletFromLocation(window.location);
+        if (!t) return;
+        t.ready.then(() => { setShim(t); setAddress(t.address); setModuleId(t.moduleId); }).catch(() => undefined).finally(() => setBusy(false));
+      });
+    }
+  }, []);
 
   // Restore a previous session (the kit remembers the wallet and address) once the page is idle.
   useEffect(() => {
+    if (__SLUICE_TEST_WALLET__ && /[?&]testwallet=/.test(window.location.search)) return;
     let off: (() => void) | undefined;
     let cancelled = false;
     const start = () => {
@@ -116,8 +159,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         .then(async (kit) => {
           if (cancelled) return;
           const { KitEventType } = await import("@creit.tech/stellar-wallets-kit/types");
-          off = kit.on(KitEventType.STATE_UPDATED, (ev) => setAddress(ev.payload.address || undefined));
-          const offDisconnect = kit.on(KitEventType.DISCONNECT, () => setAddress(undefined));
+          off = kit.on(KitEventType.STATE_UPDATED, (ev) => { setAddress(ev.payload.address || undefined); setModuleId(selectedModuleId(kit)); });
+          const offDisconnect = kit.on(KitEventType.DISCONNECT, () => { setAddress(undefined); setModuleId(undefined); });
           const prev = off;
           off = () => { prev(); offDisconnect(); };
         })
@@ -140,6 +183,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       const kit = await loadKit();
       const { address: a } = await kit.authModal();
       setAddress(a);
+      setModuleId(selectedModuleId(kit));
       return a;
     } catch (e) {
       // Closing the picker is not an error worth showing.
@@ -151,12 +195,15 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const disconnect = useCallback(async () => {
+    if (shim) return;
     const kit = await loadKit();
     await kit.disconnect();
     setAddress(undefined);
-  }, []);
+    setModuleId(undefined);
+  }, [shim]);
 
   const sign = useCallback(async (xdr: string) => {
+    if (shim) throw new WalletError("The test wallet only signs settlement orders.");
     const kit = await loadKit();
     try {
       const { signedTxXdr, signerAddress } = await kit.signTransaction(xdr, { networkPassphrase: PUBLIC, address });
@@ -165,9 +212,18 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       throw e instanceof WalletError ? e : new WalletError(walletMessage(e));
     }
-  }, [address]);
+  }, [address, shim]);
 
-  const value = useMemo(() => ({ address, busy, error, connect, disconnect, sign }), [address, busy, error, connect, disconnect, sign]);
+  const signAuthEntry = useCallback<SignAuthEntry>(async (preimage, opts) => {
+    if (shim) return shim.signAuthEntry(preimage, opts);
+    const kit = await loadKit();
+    return kit.signAuthEntry(preimage, { address: opts.address, networkPassphrase: opts.networkPassphrase });
+  }, [shim]);
+
+  const value = useMemo(
+    () => ({ address, busy, error, connect, disconnect, sign, moduleId, signAuthEntry, testWallet: shim !== undefined }),
+    [address, busy, error, connect, disconnect, sign, moduleId, signAuthEntry, shim],
+  );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 

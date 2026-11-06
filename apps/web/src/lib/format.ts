@@ -82,6 +82,15 @@ export const venueName = (id: string): string => VENUES[id] ?? id;
 export const explorerTx = (hash: string): string => `https://stellar.expert/explorer/public/tx/${hash}`;
 export const explorerAccount = (id: string): string => `https://stellar.expert/explorer/public/account/${id}`;
 
+/**
+ * A transaction on the settlement-orders network. Only the testnet has an explorer this app knows; for any other
+ * network the hash is shown without a link rather than pointing at the wrong chain.
+ */
+export const orderExplorerTx = (network: string, hash: string): string | undefined =>
+  network === "testnet" ? `https://stellar.expert/explorer/testnet/tx/${hash}` : undefined;
+export const orderExplorerAccount = (network: string, id: string): string | undefined =>
+  network === "testnet" ? `https://stellar.expert/explorer/testnet/account/${id}` : undefined;
+
 export function ago(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
   return s < 60 ? `${s}s ago` : `${Math.floor(s / 60)}m ago`;

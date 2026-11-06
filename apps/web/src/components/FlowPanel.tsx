@@ -102,7 +102,7 @@ export function useFlow(): Flow {
   return { active: running || outcome !== null, running, signing, steps, prompt, outcome, start, choose, stopWaiting, close };
 }
 
-function StepRow({ s }: { s: StepView }) {
+export function StepRow({ s }: { s: StepView }) {
   return (
     <li className="flex gap-3.5 py-3.5">
       <span className={cx("mt-0.5 grid size-7 shrink-0 place-items-center rounded-full", s.status === "done" ? "bg-accent-soft text-accent" : s.status === "failed" ? "bg-bad-soft text-bad" : "bg-shell text-muted")}>

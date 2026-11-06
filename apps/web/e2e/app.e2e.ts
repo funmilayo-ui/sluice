@@ -99,6 +99,28 @@ test("two-transaction routes are hidden until asked for", async ({ page }) => {
   await expect(page.getByRole("button", { name: /two-transaction routes shown/ })).toBeVisible();
 });
 
+test("settlement orders are off on this server: no Settle tab, a link to it lands on Swap, and nothing for it is downloaded", async ({ page }) => {
+  const problems = watch(page);
+  const requested: string[] = [];
+  page.on("request", (r) => requested.push(new URL(r.url()).pathname));
+  await page.goto("/");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("One quote across both layers.");
+  // The server answers /v1/orders/config with enabled:false; the app then never offers the mode.
+  const config = await page.request.get("/v1/orders/config");
+  expect(await config.json()).toMatchObject({ enabled: false });
+  await expect(page.getByRole("navigation", { name: "Main" }).getByRole("link", { name: "Earn", exact: true })).toBeVisible();
+  await expect(page.getByText("Testnet prototype")).toHaveCount(0);
+  // A direct link to the mode shows the standard swap and says why.
+  await page.goto("/#/settle");
+  await page.reload();
+  await expect(page.getByText("Settlement orders are not available on this deployment.")).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("One quote across both layers.");
+  await expect(page.getByRole("link", { name: /Settle/ })).toHaveCount(0);
+  // Neither the Settle screen nor the heavy Stellar SDK it signs with is fetched by a page that never signs.
+  expect(requested.filter((p) => /SettleView|stellar-sdk/.test(p))).toEqual([]);
+  expect(problems).toEqual([]);
+});
+
 test("earn shows live pool state read from the contract", async ({ page }) => {
   const problems = watch(page);
   await page.goto("/#/earn");

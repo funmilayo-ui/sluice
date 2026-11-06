@@ -7,3 +7,4 @@ target
 test-results
 playwright-report
 *.tsbuildinfo
+dist-testwallet

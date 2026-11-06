@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, SluiceError, type AccountResponse, type ListedAsset, type PositionsResponse, type QuoteResponse, type ScoredStablecoin, type VaultsResponse } from "./api";
+import { api, SluiceError, type OrdersConfig, type AccountResponse, type ListedAsset, type PositionsResponse, type QuoteResponse, type ScoredStablecoin, type VaultsResponse } from "./api";
 import { assetCode, assetIssuer, isAmount } from "./format";
 import { load, save } from "./store";
 
@@ -190,3 +190,24 @@ export function useVaults(): Loaded<VaultsResponse> {
 }
 export const usePositions = (address: string | undefined): Loaded<PositionsResponse> =>
   useLive(address ? `positions:${address}` : null, () => api.positions(address!), { refreshMs: 30_000 });
+
+export type OrdersAvailability =
+  | { status: "loading" }
+  | { status: "disabled"; reason: string }
+  | { status: "enabled"; config: Extract<OrdersConfig, { enabled: true }> };
+
+/**
+ * Whether this deployment offers settlement orders (a testnet prototype). Asked once. An old server without the
+ * endpoint, or one that cannot be reached, simply means "not offered": the rest of the app does not depend on it.
+ */
+export function useOrdersConfig(): OrdersAvailability {
+  const [v, setV] = useState<OrdersAvailability>({ status: "loading" });
+  useEffect(() => {
+    let cancelled = false;
+    api.ordersConfig()
+      .then((c) => { if (!cancelled) setV(c.enabled ? { status: "enabled", config: c } : { status: "disabled", reason: c.reason }); })
+      .catch(() => { if (!cancelled) setV({ status: "disabled", reason: "settlement orders are not available" }); });
+    return () => { cancelled = true; };
+  }, []);
+  return v;
+}
