@@ -234,9 +234,9 @@ export default function SettleView({ orders, flow }: Props) {
       <section className="min-w-0 lg:col-span-5">
         <div className="lg:sticky lg:top-28">
           <Eyebrow>Settle · Stellar {network}</Eyebrow>
-          <h1 className="mt-4 text-4xl leading-[1.05] font-medium tracking-[-0.03em] sm:text-5xl">Sign an order, not a transaction.</h1>
+          <h1 className="mt-4 text-4xl leading-[1.05] font-medium tracking-[-0.03em] sm:text-5xl">One signature. One atomic fill.</h1>
           <p className="mt-4 max-w-[46ch] text-muted">
-            Your wallet signs one authorisation. A solver submits it, pays the network fee and hedges the trade on the Stellar DEX. A contract refuses the fill if you would receive less than the minimum you signed.
+            A solver fills your order and hedges the trade on the Stellar DEX. A contract refuses the fill if you would receive less than the minimum you signed. Most wallets sign a single authorisation and the solver pays the network fee. A wallet that cannot sign one signs a transaction instead, and you pay its fee.
           </p>
 
           <p role="note" className="mt-5 flex gap-3 rounded-2xl bg-warn-soft px-4 py-3 text-sm text-warn">
