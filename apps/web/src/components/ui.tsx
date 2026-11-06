@@ -30,7 +30,7 @@ export function PrimaryButton({ children, busy, className, disabled, ...rest }: 
         className,
       )}
     >
-      <span className="truncate">{children}</span>
+      <span className="min-w-0 leading-snug text-pretty">{children}</span>
       <span className="grid size-10 shrink-0 place-items-center rounded-full bg-black/12 transition-transform duration-500 ease-spring group-hover:translate-x-0.5 group-hover:-translate-y-px group-hover:scale-105 group-disabled:translate-x-0 group-disabled:translate-y-0 group-disabled:scale-100">
         {busy ? <CircleNotch size={18} weight="light" className="animate-spin" /> : <ArrowUpRight size={18} weight="light" />}
       </span>

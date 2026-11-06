@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { OrderStatusResponse, PreparedOrder, PrepareOrderResponse } from "@sluice/sdk";
+import type { OrderStatusResponse, PreparedOrder, PreparedOrderTx, PrepareOrderResponse, PrepareOrderTxResponse } from "@sluice/sdk";
 import {
-  countdown, createOrderController, EXPIRY_MARGIN_SEC, expiry, failureFor, hedgeText, parseAssetInput, rawValues, reasonText, step, verdictFromError,
+  countdown, createOrderController, EXPIRY_MARGIN_SEC, expiry, failureFor, goodUntil, hedgeText, isTxPrepared, parseAssetInput, rawValues, reasonText, step, txSigningFailureText, verdictFromError,
   type OrderDeps, type OrderRequest, type OrderState,
 } from "./orders";
 import { SigningAborted } from "./orderWallet";
@@ -19,6 +19,13 @@ const prepared = (over: Partial<PreparedOrder["order"]> = {}): PreparedOrder => 
   order: { user: USER, assetIn: A, tokenIn: "CAAA", amountIn: "100.0000000", assetOut: C, tokenOut: "CBBB", minOut: "103.5000000", deadline: NOW / 1000 + 600, createTrustline: false, ...over },
   summary: { pay: "100.0000000", receiveAtLeast: "103.5000000", expected: "104.1000000" },
   authEntry: { xdr: "xdr", preimage: "pre", validUntilLedger: 999, credentials: "address-legacy", networkPassphrase: "Test SDF Network ; September 2015" },
+});
+const preparedTx = (over: { maxTime?: number; networkFee?: string } = {}): PreparedOrderTx => ({
+  solverWillFill: true,
+  orderId: "id-tx",
+  order: prepared().order,
+  summary: { pay: "100.0000000", receiveAtLeast: "103.5000000", expected: "104.1000000", networkFee: over.networkFee ?? "0.0140000" },
+  tx: { xdr: "txxdr", hash: "ab".repeat(32), source: USER, validUntilLedger: 999, maxTime: over.maxTime ?? NOW / 1000 + 300, networkPassphrase: "Test SDF Network ; September 2015" },
 });
 const declinedRes: PrepareOrderResponse = {
   solverWillFill: false,
@@ -272,6 +279,14 @@ describe("the controller: whole flows", () => {
     expect(deps.sign).not.toHaveBeenCalled();
   });
 
+  it("the kit 2.8.0 id for Freighter ('varial') is allowed through, like 'freighter'", async () => {
+    const { c, deps } = harness();
+    await c.prepare(req, "varial");
+    expect(c.state.phase).toBe("review");
+    await c.sign("varial");
+    expect(deps.sign).toHaveBeenCalled();
+  });
+
   it("a wallet that is merely unknown is allowed to try", async () => {
     const { c } = harness();
     await c.prepare(req, "wallet_connect");
@@ -431,5 +446,182 @@ describe("the controller: whole flows", () => {
     await c.prepare(req, "freighter");
     await c.sign("freighter");
     expect(c.state).toMatchObject({ phase: "rejected", stopped: true });
+  });
+});
+
+describe("tier 2: the user signs a transaction", () => {
+  const BOTH = ["auth-entry", "tx"] as const;
+  const txDeps = (over: Partial<OrderDeps> = {}) => ({
+    tiers: BOTH,
+    prepareTx: vi.fn(async (): Promise<PrepareOrderTxResponse> => preparedTx()),
+    signTx: vi.fn(async () => "signed-tx"),
+    submitTx: vi.fn(async () => ({ hash: "h", status: "PENDING" as const })),
+    ...over,
+  });
+
+  it("a wallet that cannot sign entries is routed to the transaction path: prepareTx, signTx, submitTx, then the same polling", async () => {
+    const { c, deps, seen } = harness(txDeps());
+    await c.prepare(req, "albedo");
+    expect(deps.prepare).not.toHaveBeenCalled();
+    expect(deps.prepareTx).toHaveBeenCalledWith(req);
+    expect(c.state).toMatchObject({ phase: "review", prepared: { orderId: "id-tx", summary: { networkFee: "0.0140000" } } });
+    await c.sign("albedo");
+    expect(deps.signTx).toHaveBeenCalledWith(expect.objectContaining({ orderId: "id-tx" }));
+    expect(deps.sign).not.toHaveBeenCalled();
+    expect(deps.submitTx).toHaveBeenCalledWith({ orderId: "id-tx", order: preparedTx().order, signedTx: "signed-tx" });
+    expect(deps.submit).not.toHaveBeenCalled();
+    expect(c.state).toMatchObject({ phase: "filled", hash: "h", received: "104.1000000" });
+    expect(seen.slice(0, 6)).toEqual(["preparing", "review", "signing", "submitting", "confirming", "filled"]);
+  });
+
+  it("a wallet that can sign entries keeps the free path even when the server offers both", async () => {
+    const { c, deps } = harness(txDeps());
+    await c.prepare(req, "varial");
+    await c.sign("varial");
+    expect(deps.prepare).toHaveBeenCalled();
+    expect(deps.sign).toHaveBeenCalled();
+    expect(deps.prepareTx).not.toHaveBeenCalled();
+    expect(deps.submitTx).not.toHaveBeenCalled();
+  });
+
+  it("is off when the server does not offer it: the wallet is stopped up front, nothing is requested", async () => {
+    for (const tiers of [undefined, ["auth-entry"] as const]) {
+      const { c, deps } = harness({ ...txDeps(), tiers });
+      await c.prepare(req, "xbull");
+      expect(c.state).toMatchObject({ phase: "unsupported", at: "before", tried: "none" });
+      expect(deps.prepareTx).not.toHaveBeenCalled();
+      expect(deps.prepare).not.toHaveBeenCalled();
+    }
+  });
+
+  it("is off when the app cannot run it, even if the server offers it", async () => {
+    const { c, deps } = harness({ tiers: BOTH });
+    await c.prepare(req, "ledger");
+    expect(c.state).toMatchObject({ phase: "unsupported", tried: "none" });
+    expect(deps.prepare).not.toHaveBeenCalled();
+  });
+
+  it("a declined tier-2 order reads like a declined one: reasons, nothing to sign", async () => {
+    const { c, deps } = harness(txDeps({ prepareTx: vi.fn(async () => declinedRes) }));
+    await c.prepare(req, "rabet");
+    expect(c.state).toMatchObject({ phase: "declined", reasons: ["no_hedge_quote"] });
+    await c.sign("rabet");
+    expect(deps.signTx).not.toHaveBeenCalled();
+  });
+
+  it("a wallet that turns out not to sign entries (an 'unknown' one) can switch to the transaction path", async () => {
+    const { c, deps } = harness(txDeps({ sign: vi.fn(async () => { throw { code: -3, message: 'Hana does not support the "signAuthEntry" function' }; }) }));
+    await c.prepare(req, "hana");
+    await c.sign("hana");
+    expect(c.state).toMatchObject({ phase: "unsupported", at: "call", tried: "auth-entry" });
+    await c.prepare(req, "hana", "transaction");
+    expect(deps.prepareTx).toHaveBeenCalledTimes(1);
+    expect(c.state).toMatchObject({ phase: "review", prepared: { orderId: "id-tx" } });
+    await c.sign("hana");
+    expect(c.state.phase).toBe("filled");
+  });
+
+  it("the override is refused when the server does not offer transactions", async () => {
+    const { c, deps } = harness({ ...txDeps(), tiers: ["auth-entry"] });
+    await c.prepare(req, "hana", "transaction");
+    expect(c.state).toMatchObject({ phase: "unsupported", tried: "none" });
+    expect(deps.prepareTx).not.toHaveBeenCalled();
+  });
+
+  it("a transaction wallet that cannot sign transactions either says so, and offers nothing further", async () => {
+    const { c } = harness(txDeps({ signTx: vi.fn(async () => { throw { code: -3, message: 'X does not support the "signTransaction" function' }; }) }));
+    await c.prepare(req, "xbull");
+    await c.sign("xbull");
+    expect(c.state).toMatchObject({ phase: "unsupported", at: "call", tried: "transaction" });
+  });
+
+  it("declining in the wallet is a refusal, not a failure; nothing was sent", async () => {
+    const { c, deps } = harness(txDeps({ signTx: vi.fn(async () => { throw { code: -4, message: "The user rejected this request." }; }) }));
+    await c.prepare(req, "albedo");
+    await c.sign("albedo");
+    expect(c.state).toMatchObject({ phase: "rejected", stopped: false });
+    expect(deps.submitTx).not.toHaveBeenCalled();
+  });
+
+  it("the SDK's own review refusals and wallet mix-ups become plain sentences, and nothing is sent", async () => {
+    const cases: [string, RegExp][] = [
+      ["the transaction does not match the hash the server reported; refusing to ask the wallet to sign it", /not exactly the order you reviewed.*not asked to sign it/],
+      ["the wallet returned a different transaction than the one it was given", /another network/],
+      ["the wallet signed with GABC, not the order's account GDEF", /different account/],
+      ["the wallet's signature on the transaction does not verify for the order's account", /does not match this transaction/],
+    ];
+    for (const [message, text] of cases) {
+      const { c, deps } = harness(txDeps({ signTx: vi.fn(async () => { throw new Error(message); }) }));
+      await c.prepare(req, "lobstr");
+      await c.sign("lobstr");
+      expect(c.state, message).toMatchObject({ phase: "failed", failure: { code: "WALLET_FAILED", title: "Nothing was signed or sent" } });
+      expect((c.state as { failure: { message: string } }).failure.message).toMatch(text);
+      expect(deps.submitTx).not.toHaveBeenCalled();
+    }
+    expect(txSigningFailureText("Extension is locked")).toBe("Extension is locked");
+  });
+
+  it("maps the tier-2 server codes to human messages", () => {
+    const codes: [string, RegExp][] = [
+      ["BAD_SEQUENCE", /another transaction after this one was prepared/],
+      ["WRONG_SOURCE", /not from your connected account/],
+      ["TX_MISMATCH", /not the transaction you reviewed/],
+      ["BAD_AUTH", /authorisations are not exactly/],
+      ["BAD_TIMEBOUNDS", /time limit/],
+      ["UNSUPPORTED_ENVELOPE", /fee bump or a muxed account/],
+      ["SOLVER_TX_MISMATCH", /solver prepared something other/],
+      ["BAD_ORDER_ID", /no longer matches/],
+      ["EXPIRED", /./],
+    ];
+    for (const [code, text] of codes) {
+      const v = verdictFromError(err(code === "BAD_SEQUENCE" ? 409 : 400, "m", { code, message: "server words" }), "submit");
+      if (code === "EXPIRED") { expect(v.kind).toBe("expired"); continue; }
+      expect(v, code).toMatchObject({ kind: "failed" });
+      expect((v as { failure: { message: string } }).failure.message, code).toMatch(text);
+      expect((v as { failure: { message: string } }).failure.message, code).toMatch(/Nothing was sent|not sent|Prepare|Try again|Switch/);
+    }
+  });
+
+  it("a submit refusal ends in failed with the server's code, and does not claim anything was sent", async () => {
+    const { c } = harness(txDeps({ submitTx: vi.fn(async () => { throw err(409, "seq", { code: "BAD_SEQUENCE", message: "m" }); }) }));
+    await c.prepare(req, "albedo");
+    await c.sign("albedo");
+    expect(c.state).toMatchObject({ phase: "failed", failure: { code: "BAD_SEQUENCE" } });
+  });
+
+  it("an unanswered submit is 'unconfirmed', never a retry that could send the transaction twice", async () => {
+    const { c } = harness(txDeps({ submitTx: vi.fn(async () => { throw Object.assign(new Error("fetch failed"), {}); }) }));
+    await c.prepare(req, "albedo");
+    await c.sign("albedo");
+    expect(c.state).toMatchObject({ phase: "unconfirmed", reason: "no-answer" });
+  });
+
+  it("a fill that fails on the ledger warns that the fee may still have been charged (and only for tier 2)", () => {
+    const failed = (prep: PreparedOrder | PreparedOrderTx) => {
+      let s: OrderState = { phase: "review", req, prepared: prep };
+      for (const ev of [{ type: "SIGN_START" }, { type: "SIGNED" }, { type: "SUBMITTED", hash: "h" }] as const) s = step(s, ev);
+      return step(s, { type: "LANDED", status: { hash: "h", status: "FAILED", explained: { code: "BELOW_MIN_OUT", message: "m", detail: "" } } }) as Extract<OrderState, { phase: "failed" }>;
+    };
+    expect(failed(preparedTx()).failure.message).toMatch(/may still have charged its fee/);
+    expect(failed(prepared()).failure.message).not.toMatch(/fee/);
+  });
+
+  it("the order's time limit is the earlier of its deadline and the transaction's expiry", () => {
+    const p = preparedTx({ maxTime: NOW / 1000 + 100 });
+    expect(isTxPrepared(p)).toBe(true);
+    expect(isTxPrepared(prepared())).toBe(false);
+    expect(goodUntil(p)).toBe(NOW / 1000 + 100);
+    expect(goodUntil(prepared())).toBe(NOW / 1000 + 600);
+    expect(expiry(p, NOW).secondsLeft).toBe(100 - EXPIRY_MARGIN_SEC);
+    expect(expiry(preparedTx({ maxTime: NOW / 1000 + 5000 }), NOW).secondsLeft).toBe(600 - EXPIRY_MARGIN_SEC);
+  });
+
+  it("an order that expires before the wallet is asked is not signed or sent", async () => {
+    const { c, deps, advance } = harness(txDeps({ signTx: vi.fn(async () => "signed-tx") }));
+    await c.prepare(req, "albedo");
+    advance(400_000);
+    await c.sign("albedo");
+    expect(c.state.phase).toBe("expired");
+    expect(deps.submitTx).not.toHaveBeenCalled();
   });
 });

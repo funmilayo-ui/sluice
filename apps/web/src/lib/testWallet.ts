@@ -14,14 +14,17 @@
  *     test harness script, never by the Sluice API) which signs with a throwaway testnet key kept in that
  *     process's memory. The harness is the "wallet"; this file is the thin interface the kit would provide.
  *
- * `?testwallet=freighter`        signs, like Freighter.
+ * `?testwallet=freighter`        signs, like Freighter. `?testwallet=varial` is the same wallet under its kit 2.8.0 id.
  * `?testwallet=freighter&reject=1` the user rejects the request (kit error code -4).
- * `?testwallet=albedo`           an id the app already knows cannot sign orders (gating refuses before any call).
+ * `?testwallet=albedo`           an id the app already knows cannot sign authorisation entries: against a server that offers the
+ *                                transaction tier (tier 2) it signs a transaction instead, like Albedo would; against one that
+ *                                does not, gating refuses before any call.
  * `?testwallet=wallet_connect`   an id the app cannot vouch for; the call fails with code -3, as a wallet that
  *                                lacks signAuthEntry does.
  * `?testwallet=freighter&slow=8` the wallet takes 8 seconds to answer (for the "waiting for your wallet" view).
  */
-import type { SignAuthEntry } from "@sluice/sdk";
+import type { SignAuthEntry, SignTransaction } from "@sluice/sdk";
+import { signingSupport } from "./orderWallet";
 
 export interface TestWallet {
   moduleId: string;
@@ -29,6 +32,7 @@ export interface TestWallet {
   /** Resolves once the harness has told us the address. */
   ready: Promise<void>;
   signAuthEntry: SignAuthEntry;
+  signTransaction: SignTransaction;
 }
 
 export function testWalletFromLocation(loc: Pick<Location, "search">): TestWallet | undefined {
@@ -45,10 +49,18 @@ export function testWalletFromLocation(loc: Pick<Location, "search">): TestWalle
     signAuthEntry: async (preimage) => {
       if (slow) await new Promise((r) => setTimeout(r, slow * 1000));
       if (reject) throw { code: -4, message: "The user rejected this request." };
-      if (moduleId !== "freighter") throw { code: -3, message: `The test wallet "${moduleId}" does not support the "signAuthEntry" function` };
+      if (signingSupport(moduleId) !== "supported") throw { code: -3, message: `The test wallet "${moduleId}" does not support the "signAuthEntry" function` };
       const res = await fetch("/__test/wallet/sign", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ preimage }) });
       if (!res.ok) throw { code: -1, message: `test harness refused: HTTP ${res.status}` };
       return (await res.json()) as { signedAuthEntry: string; signerAddress: string };
+    },
+    // Every wallet module in the kit can sign a transaction, so the stand-in does for any id.
+    signTransaction: async (txXdr, o) => {
+      if (slow) await new Promise((r) => setTimeout(r, slow * 1000));
+      if (reject) throw { code: -4, message: "The user rejected this request." };
+      const res = await fetch("/__test/wallet/sign-tx", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ xdr: txXdr, networkPassphrase: o.networkPassphrase }) });
+      if (!res.ok) throw { code: -1, message: `test harness refused: HTTP ${res.status}` };
+      return (await res.json()) as { signedTxXdr: string; signerAddress?: string };
     },
   };
   wallet.ready = fetch("/__test/wallet/address")

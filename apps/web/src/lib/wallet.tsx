@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import type { SignAuthEntry } from "@sluice/sdk";
+import type { SignAuthEntry, SignTransaction } from "@sluice/sdk";
+import { NO_MODULE_WORDS, NO_WALLET_SELECTED_MESSAGE, resolveStoredModuleId } from "./orderWallet";
 import type { TestWallet } from "./testWallet";
 
 const PUBLIC = "Public Global Stellar Network ; September 2015";
@@ -25,10 +26,10 @@ let kitPromise: Promise<Kit> | undefined;
  */
 function loadKit(): Promise<Kit> {
   kitPromise ??= (async () => {
-    const [{ StellarWalletsKit }, types, freighter, xbull, albedo, lobstr, rabet, hana] = await Promise.all([
+    const [{ StellarWalletsKit }, types, varial, xbull, albedo, lobstr, rabet, hana] = await Promise.all([
       import("@creit.tech/stellar-wallets-kit/sdk"),
       import("@creit.tech/stellar-wallets-kit/types"),
-      import("@creit.tech/stellar-wallets-kit/modules/freighter"),
+      import("@creit.tech/stellar-wallets-kit/modules/varial"),
       import("@creit.tech/stellar-wallets-kit/modules/xbull"),
       import("@creit.tech/stellar-wallets-kit/modules/albedo"),
       import("@creit.tech/stellar-wallets-kit/modules/lobstr"),
@@ -36,7 +37,7 @@ function loadKit(): Promise<Kit> {
       import("@creit.tech/stellar-wallets-kit/modules/hana"),
     ]);
     const modules = [
-      new freighter.FreighterModule(), new xbull.xBullModule(), new albedo.AlbedoModule(),
+      new varial.VarialModule(), new xbull.xBullModule(), new albedo.AlbedoModule(),
       new lobstr.LobstrModule(), new rabet.RabetModule(), new hana.HanaModule(),
     ];
     if (WALLETCONNECT_PROJECT_ID) {
@@ -73,9 +74,34 @@ function loadKit(): Promise<Kit> {
       },
       authModal: { showInstallLabel: true, hideUnsupportedWallets: false },
     });
+    await reconcileStoredSession(StellarWalletsKit, types.LocalStorageKeys.selectedModuleId, modules.map((m) => m.productId));
     return StellarWalletsKit;
   })();
   return kitPromise;
+}
+
+/**
+ * The kit stores the connected address and the id of the wallet module in localStorage, and restores both on
+ * load. After an upgrade across a module rename (Freighter became "Varial", id "freighter" -> "varial", in kit
+ * 2.8.0) the stored id names a module the kit no longer has: the address would come back with no wallet behind
+ * it, and the first signature would fail with the kit's "Please set the wallet first". Re-select the renamed
+ * module, or, if the id is simply unknown, drop the session so the user connects again.
+ */
+async function reconcileStoredSession(kit: Kit, storageKey: string, knownIds: string[]): Promise<void> {
+  let stored: string | null = null;
+  try {
+    stored = window.localStorage.getItem(storageKey);
+  } catch {
+    return; // storage blocked: the kit has nothing stored either
+  }
+  if (!stored || knownIds.includes(stored)) return;
+  const current = resolveStoredModuleId(stored, knownIds);
+  try {
+    if (current) kit.setWallet(current);
+    else await kit.disconnect();
+  } catch {
+    /* nothing to restore; the user connects again */
+  }
 }
 
 /**
@@ -103,6 +129,7 @@ function selectedModuleId(kit: Kit): string | undefined {
 export class WalletError extends Error {}
 function walletMessage(e: unknown): string {
   const m = (e as { message?: string; error?: { message?: string } })?.error?.message ?? (e as { message?: string })?.message;
+  if (typeof m === "string" && NO_MODULE_WORDS.test(m)) return NO_WALLET_SELECTED_MESSAGE;
   return typeof m === "string" && m ? m : "The wallet did not respond.";
 }
 
@@ -123,6 +150,11 @@ interface WalletState {
    * "this wallet cannot do it" (-3) from "the user said no" (-4).
    */
   signAuthEntry: SignAuthEntry;
+  /**
+   * Ask the wallet to sign a transaction on the network the order lives on (not mainnet, unlike `sign`), for settlement orders
+   * signed as a transaction (tier 2). Rejects with the wallet's own error object untouched, like `signAuthEntry`.
+   */
+  signOrderTransaction: SignTransaction;
   /** True only in a test build running the test wallet. Always false in production builds. */
   testWallet: boolean;
 }
@@ -220,9 +252,15 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     return kit.signAuthEntry(preimage, { address: opts.address, networkPassphrase: opts.networkPassphrase });
   }, [shim]);
 
+  const signOrderTransaction = useCallback<SignTransaction>(async (xdr, opts) => {
+    if (shim) return shim.signTransaction(xdr, opts);
+    const kit = await loadKit();
+    return kit.signTransaction(xdr, { address: opts.address, networkPassphrase: opts.networkPassphrase });
+  }, [shim]);
+
   const value = useMemo(
-    () => ({ address, busy, error, connect, disconnect, sign, moduleId, signAuthEntry, testWallet: shim !== undefined }),
-    [address, busy, error, connect, disconnect, sign, moduleId, signAuthEntry, shim],
+    () => ({ address, busy, error, connect, disconnect, sign, moduleId, signAuthEntry, signOrderTransaction, testWallet: shim !== undefined }),
+    [address, busy, error, connect, disconnect, sign, moduleId, signAuthEntry, signOrderTransaction, shim],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

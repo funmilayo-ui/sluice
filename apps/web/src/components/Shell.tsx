@@ -12,7 +12,7 @@ export type Tab = "swap" | "earn" | "settle";
 
 function Mark() {
   return (
-    <svg viewBox="0 0 32 32" className="size-7" aria-hidden>
+    <svg viewBox="0 0 32 32" className="size-6 min-[360px]:size-7" aria-hidden>
       <rect width="32" height="32" rx="9" className="fill-accent" />
       <path d="M9 9.25h9.5a3.5 3.5 0 0 1 0 7H13.5a3.5 3.5 0 0 0 0 7H23" fill="none" strokeWidth="2.2" strokeLinecap="round" className="stroke-accent-ink" />
     </svg>
@@ -40,11 +40,12 @@ function WalletButton({ account }: { account: AccountState }) {
         type="button"
         onClick={() => void wallet.connect()}
         disabled={wallet.busy}
-        className="inline-flex items-center gap-2 rounded-full bg-accent px-4 py-2 text-sm font-medium text-accent-ink transition-[transform,filter,opacity] duration-500 ease-spring hover:brightness-110 active:scale-[0.97] disabled:opacity-60"
+        className="inline-flex items-center gap-2 rounded-full bg-accent px-3 py-2 text-sm font-medium text-accent-ink transition-[transform,filter,opacity] duration-500 ease-spring hover:brightness-110 active:scale-[0.97] disabled:opacity-60 min-[390px]:px-4"
       >
         <Wallet size={17} weight="light" />
         <span className="hidden sm:inline">{wallet.busy ? "Wallet…" : "Connect wallet"}</span>
-        <span className="sm:hidden">{wallet.busy ? "…" : "Connect"}</span>
+        {/* Under 390px the three tabs and the mark leave no room for a word: the icon stands alone (the name stays for screen readers). */}
+        <span className="max-[389px]:sr-only sm:hidden">{wallet.busy ? "…" : "Connect"}</span>
       </button>
     );
   }
@@ -67,7 +68,7 @@ function WalletButton({ account }: { account: AccountState }) {
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className="inline-flex items-center gap-2 rounded-full bg-shell py-2 pr-3 pl-3 text-sm font-medium whitespace-nowrap ring-1 ring-line transition-transform duration-500 ease-spring active:scale-[0.97] sm:pr-4"
+        className="inline-flex items-center gap-2 rounded-full bg-shell py-2 pr-2 pl-2 text-sm font-medium whitespace-nowrap ring-1 ring-line transition-transform duration-500 ease-spring active:scale-[0.97] min-[360px]:pr-3 min-[360px]:pl-3 sm:pr-4"
       >
         <span className="hidden size-2 rounded-full bg-accent sm:block" aria-hidden />
         <span className="num sm:hidden">{shortKey(address, 3)}</span>
@@ -103,7 +104,7 @@ export function Nav({ tab, account, settle }: { tab: Tab; account: AccountState;
     <a
       href={t === "swap" ? "#/" : t === "earn" ? "#/earn" : "#/settle"}
       aria-current={tab === t ? "page" : undefined}
-      className={cx("rounded-full px-2.5 py-2 text-sm font-medium whitespace-nowrap transition-colors duration-500 ease-spring sm:px-4", tab === t ? "bg-surface text-ink shadow-float ring-1 ring-line" : "text-muted hover:text-ink")}
+      className={cx("rounded-full px-1.5 py-2 text-sm font-medium whitespace-nowrap transition-colors duration-500 ease-spring min-[360px]:px-2 min-[400px]:px-2.5 sm:px-4", tab === t ? "bg-surface text-ink shadow-float ring-1 ring-line" : "text-muted hover:text-ink")}
     >
       {label}
       {t === "settle" && <><span aria-hidden className="ml-1.5 inline-block size-1.5 rounded-full bg-warn align-middle" /><span className="sr-only"> (testnet prototype)</span></>}
@@ -111,8 +112,8 @@ export function Nav({ tab, account, settle }: { tab: Tab; account: AccountState;
   );
   return (
     <header className="pointer-events-none fixed inset-x-0 top-0 z-30 flex justify-center px-3 pt-4 sm:pt-6">
-      <nav aria-label="Main" className="pointer-events-auto flex w-full max-w-3xl items-center justify-between gap-2 rounded-full bg-(--overlay) p-1.5 ring-1 ring-line backdrop-blur-xl">
-        <a href="#/" className="flex items-center gap-2.5 rounded-full py-1 pr-1 pl-1.5 sm:pr-3" aria-label="Sluice, go to swap">
+      <nav aria-label="Main" className="pointer-events-auto flex w-full max-w-3xl items-center justify-between gap-1 min-[360px]:gap-2 rounded-full bg-(--overlay) p-1.5 ring-1 ring-line backdrop-blur-xl">
+        <a href="#/" className="flex items-center gap-2.5 rounded-full py-1 pr-0.5 pl-1 min-[360px]:pr-1 min-[360px]:pl-1.5 sm:pr-3" aria-label="Sluice, go to swap">
           <Mark />
           <span className="hidden text-[15px] font-semibold tracking-tight sm:inline">Sluice</span>
         </a>

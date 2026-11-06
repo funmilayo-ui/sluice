@@ -1,14 +1,14 @@
 import { ArrowSquareOut, Check, CircleNotch, Clock, Flask, Info, PenNib, Receipt, ShieldCheck, Warning } from "@phosphor-icons/react";
-import { signOrder } from "@sluice/sdk";
+import { signOrder, signOrderTx } from "@sluice/sdk";
 import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
-import { api, type PreparedOrder } from "../lib/api";
+import { api } from "../lib/api";
 import type { OrdersAvailability } from "../lib/data";
 import { assetCode, cx, fmt, isAmount, orderExplorerAccount, orderExplorerTx, shortKey, toStroops } from "../lib/format";
 import {
-  countdown, createOrderController, expiry, hedgeText, parseAssetInput, rawValues, reasonText,
+  countdown, createOrderController, expiry, goodUntil, hedgeText, isTxPrepared, parseAssetInput, rawValues, reasonText,
   type OrderController, type OrderDeps, type OrderState,
 } from "../lib/orders";
-import { signingSupport, UNKNOWN_WALLET_NOTE, UNSUPPORTED_WALLET_MESSAGE, UNSUPPORTED_WALLET_TITLE } from "../lib/orderWallet";
+import { signingRoute, signingSupport, UNKNOWN_WALLET_NOTE, UNSUPPORTED_WALLET_MESSAGE, UNSUPPORTED_WALLET_TITLE, type SigningRoute } from "../lib/orderWallet";
 import { load, save } from "../lib/store";
 import { useWallet } from "../lib/wallet";
 import type { Flow } from "./FlowPanel";
@@ -139,19 +139,25 @@ export default function SettleView({ orders, flow }: Props) {
   useEffect(() => save("sluice.orders.slippage", slippageBps), [slippageBps]);
 
   // One controller for the life of this screen. Its dependencies read the current wallet through a ref.
+  const tiersKey = (orders.signing.tiers ?? []).join(",");
   const [, rerender] = useReducer((n: number) => n + 1, 0);
   const controller = useMemo<OrderController>(() => {
     const deps: OrderDeps = {
+      tiers: orders.signing.tiers,
       prepare: (req) => api.prepareOrder({ account: req.account, assetIn: req.assetIn, assetOut: req.assetOut, amount: req.amount, slippageBps: req.slippageBps }),
       // signOrder checks the entry against the order shown, asks the wallet, and verifies the signature locally.
       sign: (prepared) => signOrder(prepared, (preimage, o) => walletRef.current.signAuthEntry(preimage, o), { settleContract: orders.settleContract }),
       submit: (p) => api.submitOrder(p),
+      // Tier 2: for wallets that sign a transaction, not an entry. signOrderTx reviews the whole transaction before the wallet is asked.
+      prepareTx: (req) => api.prepareOrderTx({ account: req.account, assetIn: req.assetIn, assetOut: req.assetOut, amount: req.amount, slippageBps: req.slippageBps }),
+      signTx: (prepared) => signOrderTx(prepared, (xdr, o) => walletRef.current.signOrderTransaction(xdr, o), { settleContract: orders.settleContract, solver: orders.solver }),
+      submitTx: (p) => api.submitOrderTx(p),
       status: (h) => api.order(h),
       now: () => Date.now(),
       sleep: (ms) => new Promise((r) => window.setTimeout(r, ms)),
     };
     return createOrderController(deps);
-  }, [orders.settleContract]);
+  }, [orders.settleContract, orders.solver, tiersKey]);
   useEffect(() => {
     const off = controller.subscribe(() => rerender());
     return () => { off(); controller.dispose(); };
@@ -191,6 +197,8 @@ export default function SettleView({ orders, flow }: Props) {
   const outId = parseAssetInput(assetOut);
   const valid = isAmount(amount);
   const support = signingSupport(wallet.moduleId);
+  const route = signingRoute(wallet.moduleId, orders.signing.tiers);
+  const txOffered = (orders.signing.tiers ?? []).includes("tx");
   const max = orders.limits.maxOrderIn;
   const tooBig = valid && toStroops(amount) > toStroops(max);
 
@@ -209,7 +217,7 @@ export default function SettleView({ orders, flow }: Props) {
   let action: { label: string; onClick?: () => void };
   if (flow.running) action = { label: "A swap is in progress" };
   else if (!wallet.address) action = { label: wallet.busy ? "Opening wallet…" : "Connect wallet", onClick: () => void wallet.connect() };
-  else if (support === "unsupported") action = { label: "Your wallet cannot sign orders" };
+  else if (route === "none") action = { label: "Your wallet cannot sign orders" };
   else if (!inId) action = { label: "Choose the asset you pay" };
   else if (!outId) action = { label: "Choose the asset you receive" };
   else if (inId === outId) action = { label: "Pick two different assets" };
@@ -289,7 +297,8 @@ export default function SettleView({ orders, flow }: Props) {
             </Bezel>
           </fieldset>
 
-          {wallet.address && support === "unsupported" && state.phase === "idle" && <UnsupportedNotice className="mt-3" />}
+          {wallet.address && route === "none" && state.phase === "idle" && <UnsupportedNotice className="mt-3" />}
+          {wallet.address && route === "transaction" && state.phase === "idle" && <TransactionRouteNotice className="mt-3" />}
           {wallet.address && support === "unknown" && state.phase === "idle" && <Notice tone="neutral" className="mt-3">{UNKNOWN_WALLET_NOTE}</Notice>}
           {wallet.error && <Notice tone="bad" className="mt-3">{wallet.error}</Notice>}
           <p className="mt-4 px-2 text-xs text-faint">
@@ -306,6 +315,8 @@ export default function SettleView({ orders, flow }: Props) {
           now={now}
           wallet={wallet}
           support={support}
+          route={route}
+          txOffered={txOffered}
           again={again}
         />
       </section>
@@ -322,13 +333,29 @@ function UnsupportedNotice({ className }: { className?: string }) {
   );
 }
 
-function Panel({ state, controller, orders, now, wallet, support, again }: {
+/** Shown to a wallet that cannot sign an authorisation: it will sign a transaction instead. Says what changes and what does not. */
+function TransactionRouteNotice({ className }: { className?: string }) {
+  return (
+    <div role="note" className={cx("flex gap-2.5 rounded-2xl bg-shell px-4 py-3 text-sm text-muted", className)}>
+      <Info size={18} weight="light" className="mt-0.5 shrink-0" />
+      <p>
+        Your wallet cannot sign an authorisation, so this order is signed as a transaction from your account instead. It is still one atomic fill, and the contract still refuses it if you would receive less than your minimum. What changes: you send the transaction, so <strong className="font-medium text-ink">you pay its network fee in XLM</strong>. The fee is shown before you sign.
+      </p>
+    </div>
+  );
+}
+
+function Panel({ state, controller, orders, now, wallet, support, route, txOffered, again }: {
   state: OrderState;
   controller: OrderController;
   orders: Enabled;
   now: number;
   wallet: ReturnType<typeof useWallet>;
   support: ReturnType<typeof signingSupport>;
+  /** How this wallet would sign a new order on this deployment. */
+  route: SigningRoute;
+  /** The server offers tier 2 (the user signs a transaction). */
+  txOffered: boolean;
   again(): void;
 }) {
   const net = orders.network;
@@ -357,17 +384,20 @@ function Panel({ state, controller, orders, now, wallet, support, again }: {
       return <Review state={state} controller={controller} orders={orders} now={now} support={support} moduleId={wallet.moduleId} />;
 
     case "submitting":
-    case "confirming":
+    case "confirming": {
+      const tx = isTxPrepared(state.prepared);
       return (
         <Bezel className="animate-rise" core="p-5 sm:p-7">
           <ol className="divide-y divide-line" aria-live="polite">
-            <StepRow s={{ id: "signed", title: "Signed in your wallet", status: "done", detail: "Only the authorisation was signed. No transaction was made from your account." }} />
+            <StepRow s={{ id: "signed", title: "Signed in your wallet", status: "done", detail: tx ? "You signed one transaction from your account. It has not been sent yet." : "Only the authorisation was signed. No transaction was made from your account." }} />
             <StepRow
               s={{
                 id: "sent",
                 title: "Sent to the solver",
                 status: state.phase === "submitting" ? "active" : "done",
-                detail: state.phase === "submitting" ? "The solver is checking the signature and simulating the fill." : "The solver submitted the fill and pays its fee.",
+                detail: state.phase === "submitting"
+                  ? (tx ? "The server is checking the whole transaction and simulating the fill." : "The solver is checking the signature and simulating the fill.")
+                  : (tx ? "The transaction was sent. The network fee is charged to your account." : "The solver submitted the fill and pays its fee."),
                 hash: undefined,
               }}
             />
@@ -376,11 +406,15 @@ function Panel({ state, controller, orders, now, wallet, support, again }: {
           {state.phase === "confirming" && <TxLink network={net} hash={state.hash} />}
         </Bezel>
       );
+    }
 
     case "filled": {
       const p = state.prepared;
       const out = assetCode(p.order.assetOut);
       const hedge = hedgeText(state.hedge);
+      const feeRow = isTxPrepared(p)
+        ? { label: "Network fee you paid, at most", value: `${fmt(p.summary.networkFee, 7)} XLM (charged to your account)`, text: true }
+        : { label: "Fee you paid", value: "None (the solver paid it)", text: true };
       return (
         <Bezel className="animate-rise" core="p-5 sm:p-7">
           <div aria-live="polite">
@@ -397,7 +431,7 @@ function Panel({ state, controller, orders, now, wallet, support, again }: {
                 rows={[
                   { label: "You paid", value: `${fmt(p.order.amountIn)} ${assetCode(p.order.assetIn)}`, strong: true },
                   { label: "Your minimum was", value: `${fmt(p.order.minOut)} ${out}` },
-                  { label: "Fee you paid", value: "None (the solver paid it)", text: true },
+                  feeRow,
                   ...(state.ledger ? [{ label: "Ledger", value: String(state.ledger) }] : []),
                 ]}
               />
@@ -464,25 +498,44 @@ function Panel({ state, controller, orders, now, wallet, support, again }: {
         </Bezel>
       );
 
-    case "unsupported":
+    case "unsupported": {
+      // The wallet refused to sign an authorisation entry, and the server offers the transaction route: offer it. (A wallet already
+      // known not to sign entries goes to that route before this point and never lands here.)
+      const canSwitch = txOffered && state.tried === "auth-entry";
+      const tried = state.tried === "transaction";
       return (
         <Bezel className="animate-rise" core="p-5 sm:p-7">
           <div aria-live="polite">
-            <PanelHead title={UNSUPPORTED_WALLET_TITLE}>
-              Use Freighter, or the standard swap. Nothing was signed or sent.{" "}
-              {state.at === "call" ? "The wallet reported that it does not support signing this kind of request." : "This is decided from which wallet is connected, before anything is asked of it."}
+            <PanelHead title={tried ? "Your wallet could not sign this order" : UNSUPPORTED_WALLET_TITLE}>
+              {canSwitch
+                ? "Nothing was signed or sent. Your wallet reported that it does not sign authorisations, but it can sign a transaction instead."
+                : tried
+                  ? "Your wallet reported that it does not support signing a transaction either. Nothing was signed or sent. Use the standard swap, or connect a different wallet."
+                  : <>Use Freighter (listed as Varial in newer wallet pickers), or the standard swap. Nothing was signed or sent.{" "}
+                    {state.at === "call" ? "The wallet reported that it does not support signing this kind of request." : "This is decided from which wallet is connected, before anything is asked of it."}</>}
             </PanelHead>
-            <p className="mt-3 max-w-[60ch] text-sm text-muted">
-              Settlement orders are signed as a Soroban authorisation, which only some wallets support so far. Freighter does. Sluice does not work around this: the standard swap still works with every wallet.
-            </p>
+            {canSwitch ? (
+              <p className="mt-3 max-w-[60ch] text-sm text-muted">
+                It is the same atomic fill and the contract still enforces your minimum. The difference is that you send the transaction, so you pay its network fee in XLM. You will see the fee before you sign.
+              </p>
+            ) : (
+              <p className="mt-3 max-w-[60ch] text-sm text-muted">
+                Settlement orders are signed as a Soroban authorisation, which only some wallets support so far. Freighter does. The standard swap still works with every wallet.
+              </p>
+            )}
             <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center">
-              <a href="#/" className="inline-flex items-center justify-center rounded-full bg-accent px-6 py-3 text-[15px] font-medium text-accent-ink transition-[transform,filter] duration-500 ease-spring hover:brightness-110 active:scale-[0.985]">Use the standard swap</a>
+              {canSwitch ? (
+                <PrimaryButton className="sm:w-auto" onClick={() => void controller.prepare(state.req, wallet.moduleId, "transaction")}>Sign it as a transaction instead</PrimaryButton>
+              ) : (
+                <a href="#/" className="inline-flex items-center justify-center rounded-full bg-accent px-6 py-3 text-[15px] font-medium text-accent-ink transition-[transform,filter] duration-500 ease-spring hover:brightness-110 active:scale-[0.985]">Use the standard swap</a>
+              )}
               <QuietButton onClick={() => void wallet.disconnect().then(() => wallet.connect())}>Connect a different wallet</QuietButton>
               {edit}
             </div>
           </div>
         </Bezel>
       );
+    }
 
     case "failed":
       return (
@@ -535,13 +588,14 @@ function Review({ state, controller, orders, now, support, moduleId }: {
   support: ReturnType<typeof signingSupport>;
   moduleId: string | undefined;
 }) {
-  const p: PreparedOrder = state.prepared;
+  const p = state.prepared;
+  const tx = isTxPrepared(p);
   const o = p.order;
   const left = expiry(p, now);
   const signing = state.phase === "signing";
   const rejected = state.phase === "rejected";
   const outCode = assetCode(o.assetOut);
-  const until = new Date(o.deadline * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const until = new Date(goodUntil(p) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
   return (
     <Bezel className="animate-rise" core="p-5 sm:p-7">
@@ -551,8 +605,16 @@ function Review({ state, controller, orders, now, support, moduleId }: {
           <Tag tone="warn"><Flask size={13} weight="light" />Testnet · unaudited</Tag>
         </div>
         <p className="mt-2 max-w-[60ch] text-sm text-muted">
-          The solver will fill this if you sign it. This is what you would be authorising, worked out here from the order itself, not copied from your wallet.
+          {tx
+            ? "The solver will fill this if you sign and send it. This is what the transaction does, worked out here from the transaction itself, not copied from your wallet."
+            : "The solver will fill this if you sign it. This is what you would be authorising, worked out here from the order itself, not copied from your wallet."}
         </p>
+        {tx && (
+          <p className="mt-3 flex gap-2.5 rounded-2xl bg-shell px-4 py-3 text-sm text-muted">
+            <Info size={18} weight="light" className="mt-0.5 shrink-0" />
+            <span>Signed as a transaction from your account, because your wallet cannot sign an authorisation. It is still one atomic fill that the contract enforces. <strong className="font-medium text-ink">You pay the network fee.</strong></span>
+          </p>
+        )}
 
         {rejected && (
           <p className="mt-4 flex gap-2.5 rounded-2xl bg-shell px-4 py-3 text-sm">
@@ -568,7 +630,9 @@ function Review({ state, controller, orders, now, support, moduleId }: {
               { label: "You receive at least", value: `${fmt(o.minOut)} ${outCode}`, strong: true },
               { label: "The solver expects to pay", value: `${fmt(p.summary.expected)} ${outCode}` },
               { label: "Good until", value: `${until} · ${left.expired ? "expired" : countdown(left.secondsLeft) + " left"}`, text: true },
-              { label: "Network fee to you", value: "None. The solver pays it.", text: true },
+              tx
+                ? { label: "Network fee you pay, at most", value: `${fmt(p.summary.networkFee, 7)} XLM`, text: true, strong: true }
+                : { label: "Network fee to you", value: "None. The solver pays it.", text: true },
               { label: "Network", value: `Stellar ${orders.network}`, text: true },
               { label: "Your account", value: shortKey(o.user, 6) },
             ]}
@@ -586,9 +650,19 @@ function Review({ state, controller, orders, now, support, moduleId }: {
         <div className="mt-4 rounded-2xl bg-sunken p-4 text-sm ring-1 ring-line">
           <p className="flex items-center gap-2 font-medium"><PenNib size={18} weight="light" className="text-accent" />What your wallet will show</p>
           <ul className="mt-2 list-disc space-y-1.5 pl-5 text-muted">
-            <li>It will ask you to <strong className="font-medium text-ink">“Confirm Authorizations”</strong>, not to confirm a transaction. You send no transaction and pay no fee.</li>
-            <li>It shows the contract call as raw values, not as a swap. Amounts are in units of 0.0000001, so {fmt(o.amountIn)} appears as {toStroops(o.amountIn).toString()}.</li>
-            <li>Compare them with the figures above. If they differ, decline.</li>
+            {tx ? (
+              <>
+                <li>It will ask you to sign a <strong className="font-medium text-ink">transaction</strong> from your account: one contract call to the settlement contract. The fee above comes out of your account in XLM.</li>
+                <li>It shows the contract call as raw values, not as a swap, and some wallets warn that they cannot read it (a Ledger needs blind signing turned on). Amounts are in units of 0.0000001, so {fmt(o.amountIn)} appears as {toStroops(o.amountIn).toString()}.</li>
+                <li>Compare them with the figures above. If they differ, decline. Your wallet must be on the {orders.network} network.</li>
+              </>
+            ) : (
+              <>
+                <li>It will ask you to <strong className="font-medium text-ink">“Confirm Authorizations”</strong>, not to confirm a transaction. You send no transaction and pay no fee.</li>
+                <li>It shows the contract call as raw values, not as a swap. Amounts are in units of 0.0000001, so {fmt(o.amountIn)} appears as {toStroops(o.amountIn).toString()}.</li>
+                <li>Compare them with the figures above. If they differ, decline.</li>
+              </>
+            )}
           </ul>
           <details className="mt-3">
             <summary className="cursor-pointer select-none text-muted">Raw values to compare</summary>
@@ -603,7 +677,7 @@ function Review({ state, controller, orders, now, support, moduleId }: {
           </details>
         </div>
 
-        {support === "unknown" && !signing && <Notice tone="neutral" className="mt-4">{UNKNOWN_WALLET_NOTE}</Notice>}
+        {!tx && support === "unknown" && !signing && <Notice tone="neutral" className="mt-4">{UNKNOWN_WALLET_NOTE}</Notice>}
 
         {signing ? (
           <div className="mt-5 flex flex-wrap items-center gap-3 rounded-2xl bg-sunken px-4 py-3 text-sm text-muted ring-1 ring-line">
@@ -617,7 +691,7 @@ function Review({ state, controller, orders, now, support, moduleId }: {
               <Notice tone="warn">This order has run out of time.</Notice>
             ) : (
               <PrimaryButton onClick={() => { if (rejected) controller.reviewAgain(); void controller.sign(moduleId); }}>
-                {rejected ? "Ask my wallet again" : "Sign in wallet"}
+                {rejected ? "Ask my wallet again" : tx ? "Sign transaction in wallet" : "Sign in wallet"}
               </PrimaryButton>
             )}
             <div className="flex flex-wrap gap-2">

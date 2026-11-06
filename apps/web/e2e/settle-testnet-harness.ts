@@ -33,6 +33,7 @@ import { preferIpv4, Router } from "../../../packages/core/src/index.js";
 import { createApp } from "../../../packages/api/src/app.js";
 import { loadOrdersConfig } from "../../../packages/api/src/orders/config.js";
 import { createOrdersService } from "../../../packages/api/src/orders/service.js";
+import { localSolver } from "../../../packages/api/src/orders/routes.js";
 import { defaultOrdersDeps } from "../../../packages/api/src/orders/deps.js";
 import { serve } from "../../../packages/api/node_modules/@hono/node-server/dist/index.js";
 import {
@@ -150,7 +151,11 @@ const setup = loadOrdersConfig({
   ORDERS_MAC_SECRET: createHash("sha256").update(Keypair.random().secret()).digest("hex"),
 });
 if (!setup.enabled) throw new Error(`orders config rejected: ${setup.reason}`);
-const service = createOrdersService(setup.config, defaultOrdersDeps(setup.config, { server: apiServer, fetchImpl: retryingFetch }), { pollMs: 1500 });
+// The solver runs in this process (local mode): its recovery loop retries a failed hedge, its state is in memory only.
+const solverNode = localSolver(setup.config, { log: (m) => console.log(`[solver] ${m}`) });
+await solverNode.restore();
+solverNode.start();
+const service = createOrdersService(setup.config, defaultOrdersDeps(setup.config, { server: apiServer, fetchImpl: retryingFetch }), solverNode);
 const app = createApp(new Router({ sources: [], hubs: [] }), {}, { orders: { enabled: true, service }, webDir: WEB_DIR });
 
 // Real-wallet mode: the tester adds the SLFA trustline in their own wallet; then they are paid.
@@ -184,6 +189,16 @@ const handle = async (req: Request): Promise<Response> => {
     const signature = user.sign(createHash("sha256").update(Buffer.from(preimage, "base64")).digest());
     console.log(`wallet signature #${signatures}`);
     return Response.json({ signedAuthEntry: signature.toString("base64"), signerAddress: user.publicKey() });
+  }
+  if (url.pathname === "/__test/wallet/sign-tx" && req.method === "POST" && user) {
+    // What a wallet's signTransaction does: sign the transaction hash for the given network and return the envelope.
+    const { xdr: txXdr, networkPassphrase } = (await req.json()) as { xdr?: string; networkPassphrase?: string };
+    if (typeof txXdr !== "string" || networkPassphrase !== Networks.TESTNET) return new Response("bad request", { status: 400 });
+    const tx = TransactionBuilder.fromXDR(txXdr, networkPassphrase);
+    tx.sign(user);
+    signatures++;
+    console.log(`wallet transaction signature #${signatures}`);
+    return Response.json({ signedTxXdr: tx.toXDR(), signerAddress: user.publicKey() });
   }
   return app.fetch(req);
 };
