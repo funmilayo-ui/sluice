@@ -41,3 +41,4 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
       - run: cargo install --locked stellar-cli
       - run: stellar contract build --manifest-path router/Cargo.toml
+      - run: stellar contract build --manifest-path settle/Cargo.toml
