@@ -18,17 +18,21 @@ held in the harness process. Never point any of this at mainnet (the API refuses
 A settlement order is signed as a Soroban **authorisation entry** (SEP-43 `signAuthEntry`), not as a transaction.
 The user's account sends nothing and pays no fee; a solver submits `settle.fill(order)`.
 
-Which wallets are expected to work (from the wallet kit's source, v2.7.0; none of it has been confirmed on a device):
+Which wallets are expected to work (from the wallet kit's source, v2.7.0 and v2.8.0; none of it has been confirmed on a device):
 
 | Wallet | Kit module id | App treats it as | Why |
 |---|---|---|---|
-| Freighter extension (renamed "Varial" in kit 2.8.0) | `freighter` | supported | the module calls Freighter's `signAuthEntry` |
+| Freighter extension (renamed "Varial" in kit 2.8.0; the app accepts both) | `freighter` (kit 2.7), `varial` (kit 2.8) | supported | the module calls Freighter's `signAuthEntry` |
 | Freighter Mobile through WalletConnect | `wallet_connect` | unknown, try | depends on the wallet at the other end |
 | Hana | `hana` | unknown, try | the module forwards the call; whether it signs the same bytes is unverified |
-| xBull, Albedo, LOBSTR, Rabet | `xbull`, `albedo`, `lobstr`, `rabet` | unsupported | their kit modules reject with error code -3 |
+| xBull, Albedo, LOBSTR, Rabet, Ledger, Trezor | `xbull`, `albedo`, `lobstr`, `rabet`, `ledger`, `trezor` | no entry signing; **tier 2** (a transaction) when the server offers it | their kit modules reject `signAuthEntry` with error code -3, and all of them implement `signTransaction` |
 
-"Unsupported" wallets get a plain message and no way to try. "Unknown" wallets can try, and if they answer -3 the app
-says so; if they decline (-4) the app says so. Update `apps/web/src/lib/orderWallet.ts` with whatever this pass finds.
+A wallet that cannot sign an entry is routed to **tier 2** when `GET /v1/orders/config` lists `"tx"` in
+`signing.tiers`: it signs a transaction from the user's own account and the user pays the network fee (section
+[Tier 2](#tier-2-wallets-that-sign-a-transaction)). Where the server does not offer tier 2 such a wallet gets a plain
+message and no way to try. "Unknown" wallets try an entry first, and if they answer -3 the app says so and, when
+tier 2 is offered, offers "Sign it as a transaction instead"; if they decline (-4) the app says so. Update
+`apps/web/src/lib/orderWallet.ts` with whatever this pass finds.
 
 ## Setup
 
@@ -91,8 +95,10 @@ Do them in order with one wallet, then repeat the signing cases for each further
 of the app and of the wallet popup, and fill the results table.
 
 **C1. Connect.** Connect the wallet from the nav. Expect the Settle tab to be visible with a small amber dot.
-For an unsupported wallet (xBull, Albedo, LOBSTR, Rabet): the action reads "Your wallet cannot sign orders" and a
-note says "Your wallet cannot sign this kind of order yet. Use Freighter, or the standard swap." Nothing can be
+For a wallet that cannot sign entries (xBull, Albedo, LOBSTR, Rabet, Ledger): on a server **with** tier 2 a note says it
+will sign as a transaction and the user pays the fee: continue with the Tier 2 cases below instead of C2 to C11. On a
+server **without** tier 2 the action reads "Your wallet cannot sign orders" and a note says "Your wallet cannot sign
+this kind of order yet. Use Freighter (listed as Varial in newer wallet pickers), or the standard swap." Nothing can be
 prepared. **That ends the pass for that wallet.**
 
 **C2. Price an order that needs a trustline.** Pay `100` SLFA, receive SLFC, press "Ask the solver for a price".
@@ -147,6 +153,53 @@ submission.
 request is "not supported" (code -3) expect "Your wallet cannot sign this kind of order yet", with a "Use the standard
 swap" link and nothing sent. Record the wallet's own wording.
 
+## Tier 2: wallets that sign a transaction
+
+For xBull, Albedo, LOBSTR, Rabet, Ledger (and any wallet that cannot sign an authorisation entry). The solver's
+authorisation is already in the transaction; the user's authorisation is the transaction signature, and the user
+**sends** the transaction (the solver's service submits it for them) and **pays the network fee**. It is still one
+atomic fill: the contract refuses it if the user would receive less than the minimum. Only the signing step differs.
+
+Setup: the harness above already serves tier 2 (the API it starts offers `["auth-entry", "tx"]`). Use a **normal build**
+(`HARNESS_WEB_DIR=apps/web/dist`) and a wallet switched to testnet. Fund the wallet's account with a little more XLM than
+the fee (friendbot does). Expected behaviour of the app, then record what the wallet actually does:
+
+**T1. Connect and see the route.** Connect. Expect a note: "Your wallet cannot sign an authorisation, so this order is
+signed as a transaction from your account instead ... you pay its network fee in XLM." The action reads "Ask the solver
+for a price" (not "cannot sign orders").
+
+**T2. Review shows the fee.** Price `100` SLFA. Expect the usual review plus a line "Signed as a transaction from your
+account ... You pay the network fee.", a row **"Network fee you pay, at most"** with a small XLM amount, and the button
+"Sign transaction in wallet". The wallet-wording box says it will ask for a transaction, not "Confirm Authorizations".
+Write down the fee.
+
+**T3. Sign (the main test).** Press the button. In the wallet record: the title and button wording; whether it names the
+network (must be testnet) and the fee (must match the app's); how the single contract call is shown (raw values?
+a "cannot read this transaction" or blind-signing warning? LOBSTR and Ledger are the ones to watch); whether the account
+it signs with is the connected one. Approve. Expect "Signed in your wallet" (a transaction from your account),
+"Sent to the solver" ("The network fee is charged to your account"), "Waiting for the fill to settle", then "Order filled"
+with the received amount and a row **"Network fee you paid, at most"**. In the wallet the account's history **should**
+show the fill as a transaction sent by you; XLM should be down by the fee or less (the app shows the most it can be),
+SLFA down by exactly 100, SLFC up by exactly the shown amount.
+
+**T4. Network and signer checks.** With the wallet set to the wrong network (mainnet): expect "Your wallet returned a
+different transaction than the one it was shown ... another network" and nothing sent. With a different account active
+(wallets that report the signer): "Your wallet signed with a different account". LOBSTR ignores the network and the
+address the app passes it (kit source): record exactly what happens.
+
+**T5. Decline and stop waiting.** As C6 and C7: "You declined the request in your wallet" with the order still on
+screen; "Stop waiting" works; nothing sent.
+
+**T6. Expiry and sequence.** As C8 (the time limit is the earlier of the order deadline and the transaction's expiry).
+Then price an order, send any other transaction from the same account in the wallet, and sign the order: expect the
+server to refuse with "Your account sent another transaction after this one was prepared ..." and nothing sent.
+
+**T7. A fill that fails on the ledger** (rare; for example the solver's price moved): expect the failed panel to add
+that the network may still have charged the fee, because the user sent the transaction.
+
+Record in the results table below with a `T` prefix, one row per case per wallet. Add a wallet to the "tier 2 works" list
+in this document only after T3 and T4 pass on it, and say which version you tested.
+
 ## What to record for each wallet
 
 - Wallet, version, platform (and kit module id if you can see it).
@@ -175,7 +228,13 @@ Fill one row per case per wallet. Pass means exactly as expected above. Do not f
 | C8 expiry | | "This order expired"; nothing sent | | | |
 | C9 too large | | declined with reasons; no popup | | | |
 | C10 account switch | | review cleared or signer mismatch | | | |
-| C11 unsupported at call | | "cannot sign this kind of order yet" | | | |
+| C11 unsupported at call | | "cannot sign this kind of order yet", or the transaction switch | | | |
+| T1 tier-2 route note | | note names the fee; action available | | | |
+| T2 review shows fee | | "Network fee you pay, at most" row | | | |
+| T3 sign a transaction and fill | | fee matches; fill lands; exact balances | | | |
+| T4 wrong network / account | | refused, nothing sent | | | |
+| T5 decline / stop waiting | | as C6, C7 | | | |
+| T6 expiry / sequence | | expired or "another transaction" message | | | |
 
 Wallet popup wording (copy it exactly):
 
@@ -184,12 +243,17 @@ Wallet popup wording (copy it exactly):
 | Freighter | | | | | |
 | Freighter Mobile (WalletConnect) | | | | | |
 | Hana | | | | | |
+| xBull (tier 2) | | | | | |
+| Albedo (tier 2) | | | | | |
+| LOBSTR extension (tier 2) | | | | | |
+| Rabet (tier 2) | | | | | |
+| Ledger via the kit (tier 2) | | | | | |
 
 ## Reading the outcome
 
 - C3 and C4 pass on a wallet: add its module id to `SUPPORTED` in `apps/web/src/lib/orderWallet.ts`, add it to
   the table above, and say which version you tested.
-- A wallet that answers -3 at call time: move it to unsupported in the same file.
+- A wallet that answers -3 at call time: move it to unsupported in the same file (it then takes tier 2 where offered).
 - A wallet whose popup shows the raw arguments and nothing else: that is expected today. The app's own review panel is
   the readable summary; the popup is the cross-check. If a wallet shows nothing useful at all, note it: users cannot
   verify what they sign there.
@@ -203,6 +267,8 @@ solver, real fills and hedges) with a **test-only wallet stand-in**: a build of 
 sends the preimage to a local harness, which signs `sha256(preimage)` with a throwaway key. That exercises the app's
 state machine, its local signature verification, the API, the contract and the hedge. It says **nothing** about any
 real wallet's popup, its error codes, or whether a real wallet signs the same bytes. That is what this pass is for.
+The same holds for tier 2: the shim signs a transaction hash with the throwaway key (`/__test/wallet/sign-tx` in the
+harness), standing in for xBull, Albedo and the others; no real wallet of those has been used.
 
 The shim cannot reach a production build: it is imported only behind a build-time constant that is false unless
 `SLUICE_TEST_WALLET=1` is set, so the bundler removes it (check: `grep -rl "__test/wallet" apps/web/dist` finds
